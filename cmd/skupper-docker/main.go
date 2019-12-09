@@ -193,11 +193,11 @@ address {
     distribution: multicast
 }
 
-log {
-    module: DEFAULT
-    enable: trace+
-    outputFile: qdrouterd.log
-} 
+##log {
+##    module: DEFAULT
+##    enable: trace+
+##    outputFile: qdrouterd.log
+##} 
 
 ## Connectors: ##
 `
@@ -289,7 +289,8 @@ func isInterior(tcj types.ContainerJSON) bool {
 	if config == "" {
 		log.Fatal("Could not retrieve router config")
 	}
-	return true
+	match, _ := regexp.MatchString("mode:[ ]+interior", config)
+	return match    
 }
 
 func generateConnectorName(path string) string {
@@ -765,9 +766,9 @@ func disconnect(name string, dd *DockerDetails) {
 	}
 }
 func ensureProxy(bridge Bridge, dd *DockerDetails) {
-	_, err := dd.Cli.ContainerInspect(dd.Ctx, bridge.Name)
+	_, err := dd.Cli.ContainerInspect(dd.Ctx, bridge.Name+"-proxy")
 	if err == nil {
-		fmt.Println("A Bridge of that name already exists, please choose a different name")
+		fmt.Println("A proxy bridge of that name already exists, please choose a different name")
 	} else if client.IsErrNotFound(err) {
 		var imageName string
 		if os.Getenv("PROXY_IMAGE") != "" {
@@ -787,7 +788,6 @@ func ensureProxy(bridge Bridge, dd *DockerDetails) {
 		bridges = append(bridges, bridge.Protocol+":"+bridge.Port+"=>amqp:"+bridge.Name)
 
 		bridgeCfg := strings.Join(bridges, ",")
-		fmt.Println("Bridge config", bridgeCfg)
 
 		containerCfg := &container.Config{
 			Image: imageName,
@@ -810,24 +810,23 @@ func ensureProxy(bridge Bridge, dd *DockerDetails) {
 			containerCfg,
 			hostCfg,
 			nil,
-			bridge.Name)
+			bridge.Name+"-proxy")
 		if err != nil {
-			log.Fatal("Failed to create proxy container: ", err.Error())
+			log.Fatal("Failed to create proxy bridge container: ", err.Error())
 		}
 		if err = dd.Cli.ContainerStart(dd.Ctx, cccb.ID, types.ContainerStartOptions{}); err != nil {
-			log.Fatal("Failed to start proxy container: ", err.Error())
+			log.Fatal("Failed to start proxy bridge container: ", err.Error())
 		}
 		_, err = dd.Cli.ContainerInspect(dd.Ctx, bridge.Name)
 		if err != nil {
-			log.Fatal("Failed to retrieve proxy container: ", err.Error())
+			log.Fatal("Failed to retrieve proxy bridge container: ", err.Error())
 		}
-		fmt.Println("Bridge command", bridge)
 	} else {
-		log.Fatal("Failed to ensure proxy container: ", err.Error())
+		log.Fatal("Failed to ensure proxy bridge container: ", err.Error())
 	}
 }
 
-func join(dd *DockerDetails) {
+func scan(dd *DockerDetails) {
 	filters := filters.NewArgs()
 	filters.Add("label", "io.skupper.proxy")
 
@@ -855,7 +854,7 @@ func join(dd *DockerDetails) {
 	}
 }
 
-func join2(bridge Bridge, dd *DockerDetails) {
+func join(bridge Bridge, dd *DockerDetails) {
 
 	_, err := dd.Cli.ContainerInspect(dd.Ctx, bridge.Name)
 	if err == nil {
@@ -875,7 +874,7 @@ func join2(bridge Bridge, dd *DockerDetails) {
 
 		bridges := []string{}
 
-		bridges = append(bridges, "amqp:"+bridge.Name+"=>"+bridge.Protocol+":"+bridge.Port)
+		//bridges = append(bridges, "amqp:"+bridge.Name+"=>"+bridge.Protocol+":"+bridge.Port)
 		bridges = append(bridges, bridge.Protocol+":"+bridge.Port+"=>amqp:"+bridge.Name)
 
 		bridgeCfg := strings.Join(bridges, ",")
@@ -1085,27 +1084,39 @@ func main() {
 	var bridgePort string
 	var cmdJoin = &cobra.Command{
 		Use:   "join",
-		Short: "Join the VAN instalation with address",
+		Short: "Bridge address to the VAN installation",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			//bridge := Bridge{
-			//    Name: bridgeName,
-			//    Protocol: bridgeProtocol,
-			//    Port: bridgePort,
-			//}
+			bridge := Bridge{
+			    Name: bridgeName,
+			    Protocol: bridgeProtocol,
+			    Port: bridgePort,
+			}
 			dd := initDockerConfig()
-			//            join(bridge, dd)
-			join(dd)
+			join(bridge, dd)
 
-			fmt.Println("Bridge joined")
+			fmt.Printf("%s bridged to application network", bridgeName)
+            fmt.Println()
 		},
 	}
 	cmdJoin.Flags().StringVarP(&bridgeName, "bridge-name", "", "", "Provide a unique name for the VAN address (used when removing it with leave)")
 	cmdJoin.Flags().StringVarP(&bridgeProtocol, "bridge-protocol", "", "", "Bridge protocol one of tcp, udp, http, http-2, amqp")
 	cmdJoin.Flags().StringVarP(&bridgePort, "bridge-port", "", "", "A city in Connecticut")
 
+	var cmdScan = &cobra.Command{
+		Use:   "scan",
+		Short: "Scan for labled containers to attach to the VAN instalation",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			dd := initDockerConfig()
+			scan(dd)
+            // track the count or return list of names
+			fmt.Println("Scanned and attached containers to the application network")
+		},
+	}
+
 	var rootCmd = &cobra.Command{Use: "skupper"}
 	rootCmd.Version = version
-	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdJoin)
+	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdJoin, cmdScan)
 	rootCmd.Execute()
 }
