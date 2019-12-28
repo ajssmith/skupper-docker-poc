@@ -14,22 +14,26 @@ import (
 	"text/template"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	dockertypes "github.com/docker/docker/api/types"
+	dockercontainer "github.com/docker/docker/api/types/container"
+	dockerfilters "github.com/docker/docker/api/types/filters"
+	dockermounttypes "github.com/docker/docker/api/types/mount"
+	dockernetworktypes "github.com/docker/docker/api/types/network"
+	dockerapi "github.com/docker/docker/client"
 	"github.com/docker/go-connections/nat"
 	"golang.org/x/net/context"
 
 	"github.com/skupperproject/skupper-cli/pkg/certs"
+	// note: change this when moved to skupperproject
+	"github.com/ajssmith/skupper-docker/pkg/dockershim/libdocker"
 	"github.com/spf13/cobra"
 )
 
 var (
 	version                 = "undefined"
 	hostPath                = "/tmp/skupper"
+	skupperLocalBridgePath  = hostPath + "/local-bridges/"
+	skupperRemoteBridgePath = hostPath + "/remote-bridges/"
 	skupperCertPath         = hostPath + "/qpid-dispatch-certs/"
 	skupperConnPath         = hostPath + "/connections/"
 	skupperConsoleUsersPath = hostPath + "/console-users/"
@@ -50,7 +54,7 @@ const (
 	ConnectorRoleEdge                      = "edge"
 )
 
-func connectJson(tcj types.ContainerJSON) string {
+func connectJson() string {
 	connect_json := `
 {
     "scheme": "amqps",
@@ -64,10 +68,7 @@ func connectJson(tcj types.ContainerJSON) string {
     }
 }
 `
-	var buff bytes.Buffer
-	cj := template.Must(template.New("cj").Parse(connect_json))
-	cj.Execute(&buff, tcj)
-	return buff.String()
+	return connect_json
 }
 
 type ConsoleAuthMode string
@@ -93,7 +94,7 @@ type Bridge struct {
 }
 
 type DockerDetails struct {
-	Cli *client.Client
+	Cli *dockerapi.Client
 	Ctx context.Context
 }
 
@@ -122,8 +123,8 @@ listener {
     port: 5671
     role: normal
     sslProfile: skupper-amqps
-    saslMechanisms: EXTERNAL
-    authenticatePeer: true
+    saslMechanisms: ANONYMOUS PLAIN
+    authenticatePeer: false
 }
 
 {{- if eq .Console "openshift"}}
@@ -304,7 +305,7 @@ func setEnvVar(current []string, name string, value string) []string {
 	return updated
 }
 
-func isInterior(tcj types.ContainerJSON) bool {
+func isInterior(tcj *dockertypes.ContainerJSON) bool {
 	config := findEnvVar(tcj.Config.Env, "QDROUTERD_CONF")
 	if config == "" {
 		log.Fatal("Could not retrieve router config")
@@ -333,7 +334,7 @@ func generateConnectorName(path string) string {
 	return "conn" + strconv.Itoa(max)
 }
 
-func getRouterMode(tcj types.ContainerJSON) RouterMode {
+func getRouterMode(tcj *dockertypes.ContainerJSON) RouterMode {
 	if isInterior(tcj) {
 		return RouterModeInterior
 	} else {
@@ -348,12 +349,20 @@ func routerEnv(router *Router) []string {
 		envVars = append(envVars, "APPLICATION_NAME=skupper-router")
 	}
 	envVars = append(envVars, "QDROUTERD_CONF="+routerConfig(router))
-
+	envVars = append(envVars, "PN_TRACE_FRM=1")
 	if router.Console == ConsoleAuthModeInternal {
 		envVars = append(envVars, "QDROUTERD_AUTO_CREATE_SASLDB_SOURCE=/etc/qpid-dispatch/sasl-users/")
 		envVars = append(envVars, "QDROUTERD_AUTO_CREATE_SASLDB_PATH=/tmp/qdrouterd.sasldb")
 	}
 
+	return envVars
+}
+
+func syncEnv(name string) []string {
+	envVars := []string{}
+	if name != "" {
+		envVars = append(envVars, "ICPROXY_BRIDGE_HOST="+name)
+	}
 	return envVars
 }
 
@@ -436,7 +445,7 @@ func ensureCA(name string) certs.CertificateData {
 	return caData
 }
 
-func generateCredentials(caData certs.CertificateData, name string, subject string, hosts string, includeConnectJson bool, tcj types.ContainerJSON) {
+func generateCredentials(caData certs.CertificateData, name string, subject string, hosts string, includeConnectJson bool) {
 	certData := certs.GenerateCertificateData(name, subject, hosts, caData)
 
 	for k, v := range certData {
@@ -446,18 +455,25 @@ func generateCredentials(caData certs.CertificateData, name string, subject stri
 	}
 
 	if includeConnectJson {
-		certData["connect.json"] = []byte(connectJson(tcj))
-		if err := ioutil.WriteFile(skupperCertPath+name+"/connect.json", []byte(connectJson(tcj)), 0755); err != nil {
+		certData["connect.json"] = []byte(connectJson())
+		if err := ioutil.WriteFile(skupperCertPath+name+"/connect.json", []byte(connectJson()), 0755); err != nil {
 			log.Fatal("Failed to write connect file: ", err.Error())
 		}
 	}
+
 }
 
-func RouterHostConfig(router *Router, volumes []string) *container.HostConfig {
+func createRouterHostFiles(volumes []string) {
 
 	// only called during init, remove previous files and start anew
 	_ = os.RemoveAll(hostPath)
 	if err := os.MkdirAll(hostPath, 0755); err != nil {
+		log.Fatal("Failed to create skupper host directory: ", err.Error())
+	}
+	if err := os.Mkdir(skupperLocalBridgePath, 0755); err != nil {
+		log.Fatal("Failed to create skupper host directory: ", err.Error())
+	}
+	if err := os.Mkdir(skupperRemoteBridgePath, 0755); err != nil {
 		log.Fatal("Failed to create skupper host directory: ", err.Error())
 	}
 	if err := os.Mkdir(skupperCertPath, 0755); err != nil {
@@ -478,25 +494,29 @@ func RouterHostConfig(router *Router, volumes []string) *container.HostConfig {
 		}
 	}
 
-	hostcfg := &container.HostConfig{
-		Mounts: []mount.Mount{
+}
+
+func routerHostConfig(router *Router) *dockercontainer.HostConfig {
+
+	hostcfg := &dockercontainer.HostConfig{
+		Mounts: []dockermounttypes.Mount{
 			{
-				Type:   mount.TypeBind,
+				Type:   dockermounttypes.TypeBind,
 				Source: skupperConnPath,
 				Target: "/etc/qpid-dispatch/connections",
 			},
 			{
-				Type:   mount.TypeBind,
+				Type:   dockermounttypes.TypeBind,
 				Source: skupperCertPath,
 				Target: "/etc/qpid-dispatch-certs",
 			},
 			{
-				Type:   mount.TypeBind,
+				Type:   dockermounttypes.TypeBind,
 				Source: skupperConsoleUsersPath,
 				Target: "/etc/qpid-dispatch/sasl-users/",
 			},
 			{
-				Type:   mount.TypeBind,
+				Type:   dockermounttypes.TypeBind,
 				Source: skupperSaslConfigPath,
 				Target: "/etc/sasl2",
 			},
@@ -506,7 +526,7 @@ func RouterHostConfig(router *Router, volumes []string) *container.HostConfig {
 	return hostcfg
 }
 
-func RouterContainer(router *Router) *container.Config {
+func routerContainerConfig(router *Router) *dockercontainer.Config {
 	var image string
 
 	labels := getLabels("router", Bridge{})
@@ -516,11 +536,11 @@ func RouterContainer(router *Router) *container.Config {
 	} else {
 		image = "quay.io/interconnectedcloud/qdrouterd"
 	}
-	cfg := &container.Config{
+	cfg := &dockercontainer.Config{
 		Hostname: "skupper-router",
 		Image:    image,
 		Env:      routerEnv(router),
-		Healthcheck: &container.HealthConfig{
+		Healthcheck: &dockercontainer.HealthConfig{
 			Test:        []string{"curl --fail -s http://localhost:9090/healthz || exit 1"},
 			StartPeriod: time.Duration(60),
 		},
@@ -531,20 +551,43 @@ func RouterContainer(router *Router) *container.Config {
 	return cfg
 }
 
-func restartRouterContainer(dd *DockerDetails) types.ContainerJSON {
-	current, err := dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
+func routerNetworkConfig() *dockernetworktypes.NetworkingConfig {
+	netcfg := &dockernetworktypes.NetworkingConfig{
+		EndpointsConfig: map[string]*dockernetworktypes.EndpointSettings{
+			"skupper-network": {},
+		},
+	}
+
+	return netcfg
+}
+
+func makeRouterContainerCreateConfig(router *Router) *dockertypes.ContainerCreateConfig {
+
+	opts := &dockertypes.ContainerCreateConfig{
+		Name:             "skupper-router",
+		Config:           routerContainerConfig(router),
+		HostConfig:       routerHostConfig(router),
+		NetworkingConfig: routerNetworkConfig(),
+	}
+
+	return opts
+}
+
+func restartRouterContainer(dd libdocker.Interface) {
+
+	current, err := dd.InspectContainer("skupper-router")
 	if err != nil {
 		log.Fatal("Failed to retrieve router container (need init?): ", err.Error())
 	} else {
-		mounts := []mount.Mount{}
+		mounts := []dockermounttypes.Mount{}
 		for _, v := range current.Mounts {
-			mounts = append(mounts, mount.Mount{
+			mounts = append(mounts, dockermounttypes.Mount{
 				Type:   v.Type,
 				Source: v.Source,
 				Target: v.Destination,
 			})
 		}
-		hostCfg := &container.HostConfig{
+		hostCfg := &dockercontainer.HostConfig{
 			Mounts:     mounts,
 			Privileged: true,
 		}
@@ -571,10 +614,10 @@ func restartRouterContainer(dd *DockerDetails) types.ContainerJSON {
 
 		newEnv := setEnvVar(currentEnv, "QDROUTERD_CONF", updated)
 
-		containerCfg := &container.Config{
+		containerCfg := &dockercontainer.Config{
 			Hostname: current.Config.Hostname,
 			Image:    current.Config.Image,
-			Healthcheck: &container.HealthConfig{
+			Healthcheck: &dockercontainer.HealthConfig{
 				Test:        []string{"curl --fail -s http://localhost:9090/healthz || exit 1"},
 				StartPeriod: time.Duration(60),
 			},
@@ -583,134 +626,44 @@ func restartRouterContainer(dd *DockerDetails) types.ContainerJSON {
 			Env:          newEnv,
 		}
 
-		// c-ya-later
-		err = dd.Cli.ContainerStop(dd.Ctx, "skupper-router", nil)
+		// remove current and create new container
+		err = dd.StopContainer("skupper-router", 10*time.Second)
 		if err == nil {
-			if err := dd.Cli.ContainerRemove(dd.Ctx, "skupper-router", types.ContainerRemoveOptions{}); err != nil {
+			if err := dd.RemoveContainer("skupper-router", dockertypes.ContainerRemoveOptions{}); err != nil {
 				log.Fatal("Failed to remove router container: ", err.Error())
 			}
 		}
 
-		cccb, err := dd.Cli.ContainerCreate(dd.Ctx,
-			containerCfg,
-			hostCfg,
-			nil,
-			"skupper-router")
+		opts := &dockertypes.ContainerCreateConfig{
+			Name:             "skupper-router",
+			Config:           containerCfg,
+			HostConfig:       hostCfg,
+			NetworkingConfig: routerNetworkConfig(),
+		}
+		_, err = dd.CreateContainer(*opts)
 		if err != nil {
 			log.Fatal("Failed to re-create router container: ", err.Error())
 		}
-		if err = dd.Cli.ContainerStart(dd.Ctx, cccb.ID, types.ContainerStartOptions{}); err != nil {
-			log.Fatal("Failed to start router container: ", err.Error())
-		}
-		current, err = dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
+
+		err = dd.StartContainer(opts.Name)
 		if err != nil {
-			log.Fatal("Failed to retrieve router container: ", err.Error())
-		}
-		if err := dd.Cli.NetworkConnect(dd.Ctx, "skupper-network", "skupper-router", &network.EndpointSettings{}); err != nil {
-			log.Fatal("Failed to connect skupper router to network: ", err.Error())
+			log.Fatal("Failed to re-start router container: ", err.Error())
 		}
 
-		// now cycle through and restart any proxies that have attached to the VAN
+		err = dd.RestartContainer("skupper-service-sync", 10*time.Second)
+		if err != nil {
+			log.Fatal("Failed to re-start sercie sync container: ", err.Error())
+		}
 		restartProxies(dd)
 	}
-	return current
-}
-
-func ensureRouterContainer(router *Router, volumes []string, dd *DockerDetails) types.ContainerJSON {
-
-	existing, err := dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
-	if err == nil {
-		// Container exists, do we need to update or restart it?
-		fmt.Println("Router container already exists")
-		return existing
-	}
-
-	routerContainer := RouterContainer(router)
-	routerHostConfig := RouterHostConfig(router, volumes)
-	networkConfig := &network.NetworkingConfig{
-		EndpointsConfig: map[string]*network.EndpointSettings{
-			"skupper-network": {},
-		},
-	}
-
-	cccb, err := dd.Cli.ContainerCreate(dd.Ctx,
-		routerContainer,
-		routerHostConfig,
-		networkConfig,
-		"skupper-router")
-	if err != nil {
-		log.Fatal("Failed to create router container: ", err.Error())
-	}
-	if err = dd.Cli.ContainerStart(dd.Ctx, cccb.ID, types.ContainerStartOptions{}); err != nil {
-		log.Fatal("Failed to start router container: ", err.Error())
-	}
-	existing, err = dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
-	if err != nil {
-		log.Fatal("Failed to retrieve router container: ", err.Error())
-	}
-	return existing
 
 }
 
-func ensureSkupperNetwork(router *Router, dd *DockerDetails) {
-	_, err := dd.Cli.NetworkInspect(dd.Ctx, "skupper-network", types.NetworkInspectOptions{})
-	if err == nil {
-		// Network exists, nothing to see here
-		fmt.Println("Skupper docker network already exists")
-		return
-	} else {
-		_, err = dd.Cli.NetworkCreate(dd.Ctx, "skupper-network", types.NetworkCreate{
-			CheckDuplicate: true,
-			Driver:         "bridge",
-		})
-		if err != nil {
-			log.Fatal("Failed to create docker network: ", err.Error())
-		}
-	}
-}
+func generateConnectSecret(subject string, secretFile string) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-func initCommon(router *Router, volumes []string, dd *DockerDetails) types.ContainerJSON {
-	if router.Name == "" {
-		info, err := dd.Cli.Info(dd.Ctx)
-		if err != nil {
-			log.Fatal("Failed to retrieve context info: ", err.Error())
-		} else {
-			router.Name = info.Name
-		}
-	}
-	ensureSkupperNetwork(router, dd)
-	tcj := ensureRouterContainer(router, volumes, dd)
-
-	myhost := "skupper-router"
-
-	// start here and come up with version of generateSecret called generateCertificate
-	caData := ensureCA("skupper-ca")
-	generateCredentials(caData, "skupper-amqps", myhost, myhost, false, tcj)
-	generateCredentials(caData, "skupper", myhost, "", true, tcj)
-
-	if router.Console == ConsoleAuthModeInternal {
-		ensureSaslConfig()
-		ensureSaslUsers(router.ConsoleUser, router.ConsolePassword)
-	}
-
-	return tcj
-}
-
-func initEdge(router *Router, dd *DockerDetails) types.ContainerJSON {
-	return initCommon(router, []string{"skupper", "skupper-amqps"}, dd)
-}
-
-func initInterior(router *Router, dd *DockerDetails) types.ContainerJSON {
-	tcj := initCommon(router, []string{"skupper", "skupper-amqps", "skupper-internal"}, dd)
-	internalCaData := ensureCA("skupper-internal-ca")
-	// note, come back once it is understood how the network acess will work to generates host
-	generateCredentials(internalCaData, "skupper-internal", "skupper-internal", "skupper-internal", false, tcj)
-	return tcj
-}
-
-func generateConnectSecret(subject string, secretFile string, dd *DockerDetails) {
 	// verify that the local deployment is interior
-	current, err := dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
+	current, err := dd.InspectContainer("skupper-router")
 	if err == nil {
 		if isInterior(current) {
 			caData, err := getCertData("skupper-internal-ca")
@@ -725,15 +678,17 @@ func generateConnectSecret(subject string, secretFile string, dd *DockerDetails)
 		} else {
 			fmt.Println("Edge mode configuration cannot accept connections")
 		}
-	} else if client.IsErrNotFound(err) {
+	} else if dockerapi.IsErrNotFound(err) {
 		fmt.Println("Router container does not exist (need init?): " + err.Error())
 	} else {
 		fmt.Println("Error retrieving router container: " + err.Error())
 	}
 }
 
-func status(dd *DockerDetails, listConnectors bool) {
-	current, err := dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
+func status(listConnectors bool) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	current, err := dd.InspectContainer("skupper-router")
 	if err == nil {
 		mode := getRouterMode(current)
 		var modedesc string
@@ -745,7 +700,7 @@ func status(dd *DockerDetails, listConnectors bool) {
 		if listConnectors {
 			fmt.Println("You want connectors do you")
 		}
-	} else if client.IsErrNotFound(err) {
+	} else if dockerapi.IsErrNotFound(err) {
 		fmt.Println("Skupper is not currently enabled")
 	} else {
 		log.Fatal("Failed to retrieve router container: ", err.Error())
@@ -753,68 +708,95 @@ func status(dd *DockerDetails, listConnectors bool) {
 
 }
 
-func deleteSkupper(dd *DockerDetails) {
+func delete() {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-	filters := filters.NewArgs()
+	_, err := dd.InspectContainer("skupper-service-sync")
+	if err == nil {
+		dd.StopContainer("skupper-service-sync", 10*time.Second)
+		if err != nil {
+			log.Fatal("Failed to stop service sync container: ", err.Error())
+		}
+		err = dd.RemoveContainer("skupper-service-sync", dockertypes.ContainerRemoveOptions{})
+		if err != nil {
+			log.Fatal("Failed to remove service sync container: ", err.Error())
+		}
+	}
+
+	filters := dockerfilters.NewArgs()
 	filters.Add("label", "skupper.io/component")
 
-	fmt.Print("Stopping skupper proxy containers...")
-	containers, err := dd.Cli.ContainerList(dd.Ctx, types.ContainerListOptions{
+	opts := dockertypes.ContainerListOptions{
 		Filters: filters,
 		All:     true,
-	})
+	}
+	containers, err := dd.ListContainers(opts)
 	if err != nil {
 		log.Fatal("Failed to list proxy containers: ", err.Error())
 	}
+
+	fmt.Println("Stopping skupper proxy containers...")
 	for _, container := range containers {
 		labels := container.Labels
 		for k, v := range labels {
 			if k == "skupper.io/component" && v == "proxy" {
-				_ = dd.Cli.ContainerStop(dd.Ctx, container.ID, nil)
-				_ = dd.Cli.ContainerRemove(dd.Ctx, container.ID, types.ContainerRemoveOptions{})
+				err := dd.StopContainer(container.ID, 10*time.Second)
+				if err != nil {
+					log.Fatal("Failed to stop proxy container: ", err.Error())
+				}
+				err = dd.RemoveContainer(container.ID, dockertypes.ContainerRemoveOptions{})
+				if err != nil {
+					log.Fatal("Failed to remove proxy container: ", err.Error())
+				}
 			}
 		}
 	}
 
-	fmt.Print("Stopping skupper-router container...")
-	err = dd.Cli.ContainerStop(dd.Ctx, "skupper-router", nil)
+	fmt.Println("Stopping skupper-router container...")
+	err = dd.StopContainer("skupper-router", 10*time.Second)
 	if err == nil {
-		fmt.Print("Removing container...")
-		if err := dd.Cli.ContainerRemove(dd.Ctx, "skupper-router", types.ContainerRemoveOptions{}); err != nil {
+		err := dd.RemoveContainer("skupper-router", dockertypes.ContainerRemoveOptions{})
+		if err != nil {
 			log.Fatal("Failed to remove router container: ", err.Error())
 		}
-		fmt.Println("Skupper is now removed")
-
-	} else if client.IsErrNotFound(err) {
+	} else if dockerapi.IsErrNotFound(err) {
 		fmt.Println("Router container does not exist")
 	} else {
 		log.Fatal("Failed to stop router container: ", err.Error())
 	}
 
-	// remove any networks that we created, first remove any containers
-	// still on the network
-	tnr, err := dd.Cli.NetworkInspect(dd.Ctx, "skupper-network", types.NetworkInspectOptions{})
+	fmt.Println("Removing skupper-network network...")
+	// first remove any containers that remain on the network
+	tnr, err := dd.InspectNetwork("skupper-network")
 	if err == nil {
 		for _, container := range tnr.Containers {
-			err := dd.Cli.NetworkDisconnect(dd.Ctx, "skupper-network", container.Name, true)
+			err := dd.DisconnectContainerFromNetwork("skupper-network", container.Name, true)
 			if err != nil {
 				log.Fatal("Failed to disconnect container from skupper-network: ", err.Error())
 			}
 		}
 	}
-	dd.Cli.NetworkRemove(dd.Ctx, "skupper-network")
+	err = dd.RemoveNetwork("skupper-network")
+	if err != nil {
+		log.Fatal("Failed to remove skupper-network network: ", err.Error())
+	}
 
-	// remove /tmp/skupper
+	log.Println("Removing files and directory...")
 	err = os.RemoveAll(hostPath)
+	if err != nil {
+		log.Fatal("Failed to remove skupper files and directory: ", err.Error())
+	}
+	fmt.Println("Skupper resources now removed")
 }
 
-func connect(secretFile string, connectorName string, cost int, dd *DockerDetails) {
+func connect(secretFile string, connectorName string, cost int) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 	// TODO: how to detect duplicate connection tokens?
 	// examine host and port for each configured connector, should not collide
 
 	secret := certs.GetSecretContent(secretFile)
 	if secret != nil {
-		existing, err := dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
+		existing, err := dd.InspectContainer("skupper-router")
 		if err == nil {
 			mode := getRouterMode(existing)
 
@@ -860,10 +842,10 @@ func connect(secretFile string, connectorName string, cost int, dd *DockerDetail
 	}
 }
 
-func disconnect(name string, dd *DockerDetails) {
-	_, err := dd.Cli.ContainerInspect(dd.Ctx, "skupper-router")
+func disconnect(name string) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+	_, err := dd.InspectContainer("skupper-router")
 	if err == nil {
-		// do we care if name directory does not exist?
 		err = os.RemoveAll(skupperConnPath + name)
 		restartRouterContainer(dd)
 	} else {
@@ -871,38 +853,158 @@ func disconnect(name string, dd *DockerDetails) {
 	}
 }
 
-func restartProxies(dd *DockerDetails) {
-	filters := filters.NewArgs()
+func skupperInit(router *Router) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	if router.Name == "" {
+		info, err := dd.Info()
+		if err != nil {
+			log.Fatal("Failed to retrieve docker client info: ", err.Error())
+		} else {
+			router.Name = info.Name
+		}
+	}
+
+	imageName := "quay.io/interconnectedcloud/qdrouterd"
+	err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
+	if err != nil {
+		log.Fatal("Failed to pull qdrouterd image: ", err.Error())
+	}
+
+	_, err = dd.CreateNetwork("skupper-network")
+	if err != nil {
+		log.Fatal("Failed to create skupper network: ", err.Error())
+	}
+
+	volumes := []string{"skupper", "skupper-amqps"}
+	if router.Mode == RouterModeInterior {
+		volumes = append(volumes, "skupper-internal")
+	}
+
+	createRouterHostFiles(volumes)
+
+	opts := makeRouterContainerCreateConfig(router)
+	_, err = dd.CreateContainer(*opts)
+	if err != nil {
+		log.Fatal("Failed to create skupper router container: ", err.Error())
+	}
+
+	err = dd.StartContainer(opts.Name)
+	if err != nil {
+		log.Fatal("Failed to start skupper router container: ", err.Error())
+	}
+
+	caData := ensureCA("skupper-ca")
+	generateCredentials(caData, "skupper-amqps", opts.Name, opts.Name, false)
+	generateCredentials(caData, "skupper", opts.Name, "", true)
+	if router.Mode == RouterModeInterior {
+		internalCaData := ensureCA("skupper-internal-ca")
+		generateCredentials(internalCaData, "skupper-internal", "skupper-internal", "skupper-internal", false)
+	}
+
+	if router.Console == ConsoleAuthModeInternal {
+		ensureSaslConfig()
+		ensureSaslUsers(router.ConsoleUser, router.ConsolePassword)
+	}
+
+	startServiceSync(dd)
+}
+
+func restartProxies(dd libdocker.Interface) {
+
+	filters := dockerfilters.NewArgs()
 	filters.Add("label", "skupper.io/component")
 
-	containers, err := dd.Cli.ContainerList(dd.Ctx, types.ContainerListOptions{
+	containers, err := dd.ListContainers(dockertypes.ContainerListOptions{
 		Filters: filters,
 		All:     true,
 	})
 	if err != nil {
 		log.Fatal("Failed to list proxy containers: ", err.Error())
 	}
+
 	for _, container := range containers {
 		labels := container.Labels
 		for k, v := range labels {
 			if k == "skupper.io/component" && v == "proxy" {
-				_ = dd.Cli.ContainerRestart(dd.Ctx, container.ID, nil)
+				err = dd.RestartContainer(container.ID, 10*time.Second)
+				if err != nil {
+					log.Fatal("Failed to restart proxy container: ", err.Error())
+				}
 			}
 		}
+	}
+}
+
+func startServiceSync(dd libdocker.Interface) {
+	_, err := dd.InspectContainer("skupper-service-sync")
+	if err == nil {
+		fmt.Println("Container skupper-service-syncy already exists")
+		return
+	} else if dockerapi.IsErrNotFound(err) {
+		var imageName string
+		if os.Getenv("SERVICE_SYNC_IMAGE") != "" {
+			imageName = os.Getenv("SERVICE_SYNC_IMAGE")
+		} else {
+			imageName = "quay.io/ajssmith/service-sync-go"
+		}
+		err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
+		if err != nil {
+			log.Fatal("Failed to pull service sync image: ", err.Error())
+		}
+
+		containerCfg := &dockercontainer.Config{
+			Hostname: "skupper-service-sync",
+			Image:    imageName,
+			Cmd:      []string{"app"},
+		}
+		hostCfg := &dockercontainer.HostConfig{
+			Mounts: []dockermounttypes.Mount{
+				{
+					Type:   dockermounttypes.TypeBind,
+					Source: skupperCertPath + "skupper",
+					Target: "/etc/messaging",
+				},
+			},
+			Privileged: true,
+		}
+		networkCfg := &dockernetworktypes.NetworkingConfig{
+			EndpointsConfig: map[string]*dockernetworktypes.EndpointSettings{
+				"skupper-network": {},
+			},
+		}
+		opts := &dockertypes.ContainerCreateConfig{
+			Name:             "skupper-service-sync",
+			Config:           containerCfg,
+			HostConfig:       hostCfg,
+			NetworkingConfig: networkCfg,
+		}
+		_, err = dd.CreateContainer(*opts)
+		if err != nil {
+			log.Fatal("Failed to create service sync container: ", err.Error())
+		}
+		err = dd.StartContainer(opts.Name)
+		if err != nil {
+			log.Fatal("Failed to start service sync container: ", err.Error())
+		}
+
+	} else {
+		log.Fatal("Failed to create skupper-service-sync container")
 	}
 
 }
 
-func attachToVAN(bridge Bridge, dd *DockerDetails) bool {
+func attachToVAN(bridge Bridge) bool {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
 	if bridge.Process != "" {
 		if bridge.Name == bridge.Process {
 			fmt.Println("The bridge and process names must be unique")
 			return false
 		}
-		_, err := dd.Cli.ContainerInspect(dd.Ctx, bridge.Process)
+		_, err := dd.InspectContainer(bridge.Process)
 		if err != nil {
-			if client.IsErrNotFound(err) {
+			if dockerapi.IsErrNotFound(err) {
 				fmt.Println("The process to bridge was not found (need docker run?)")
 				return false
 			} else {
@@ -911,35 +1013,31 @@ func attachToVAN(bridge Bridge, dd *DockerDetails) bool {
 		}
 	}
 
-	_, err := dd.Cli.ContainerInspect(dd.Ctx, bridge.Name)
+	_, err := dd.InspectContainer(bridge.Name)
 	if err == nil {
 		fmt.Printf("A Bridge with the address %s already exists, please choose a different one", bridge.Name)
 		fmt.Println()
-	} else if client.IsErrNotFound(err) {
+	} else if dockerapi.IsErrNotFound(err) {
 		var imageName string
 		if os.Getenv("PROXY_IMAGE") != "" {
 			imageName = os.Getenv("PROXY_IMAGE")
 		} else {
 			imageName = "quay.io/ajssmith/icproxy-simple"
 		}
-		out, err := dd.Cli.ImagePull(dd.Ctx, imageName, types.ImagePullOptions{})
+		err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
 		if err != nil {
 			log.Fatal("Failed to pull proxy image: ", err.Error())
 		}
-		defer out.Close()
 
 		labels := getLabels("proxy", bridge)
-
 		bridges := []string{}
-
 		bridges = append(bridges, "amqp:"+bridge.Name+"=>"+bridge.Protocol+":"+bridge.Port)
 		if bridge.Process != "" {
 			bridges = append(bridges, bridge.Protocol+":"+bridge.Port+"=>amqp:"+bridge.Name)
 		}
-
 		bridgeCfg := strings.Join(bridges, ",")
 
-		containerCfg := &container.Config{
+		containerCfg := &dockercontainer.Config{
 			Hostname: bridge.Name,
 			Image:    imageName,
 			Cmd: []string{
@@ -949,44 +1047,43 @@ func attachToVAN(bridge Bridge, dd *DockerDetails) bool {
 			Env:    proxyEnv(bridge),
 			Labels: labels,
 		}
-		hostCfg := &container.HostConfig{
-			Mounts: []mount.Mount{
+		hostCfg := &dockercontainer.HostConfig{
+			Mounts: []dockermounttypes.Mount{
 				{
-					Type:   mount.TypeBind,
+					Type:   dockermounttypes.TypeBind,
 					Source: skupperCertPath + "skupper",
 					Target: "/etc/messaging",
 				},
 			},
 			Privileged: true,
 		}
-		networkCfg := &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
+		networkCfg := &dockernetworktypes.NetworkingConfig{
+			EndpointsConfig: map[string]*dockernetworktypes.EndpointSettings{
 				"skupper-network": {},
 			},
 		}
-		cccb, err := dd.Cli.ContainerCreate(dd.Ctx,
-			containerCfg,
-			hostCfg,
-			networkCfg,
-			bridge.Name)
+
+		opts := &dockertypes.ContainerCreateConfig{
+			Name:             bridge.Name,
+			Config:           containerCfg,
+			HostConfig:       hostCfg,
+			NetworkingConfig: networkCfg,
+		}
+		_, err = dd.CreateContainer(*opts)
 		if err != nil {
 			log.Fatal("Failed to create proxy container: ", err.Error())
 		}
-		if err = dd.Cli.ContainerStart(dd.Ctx, cccb.ID, types.ContainerStartOptions{}); err != nil {
-			log.Fatal("Failed to start proxy container: ", err.Error())
-		}
-		_, err = dd.Cli.ContainerInspect(dd.Ctx, bridge.Name)
+		err = dd.StartContainer(opts.Name)
 		if err != nil {
-			log.Fatal("Failed to retrieve proxy container: ", err.Error())
+			log.Fatal("Failed to start proxy container: ", err.Error())
 		}
 	} else {
 		log.Fatal("Failed to create proxy container: ", err.Error())
 	}
 
-	err = dd.Cli.NetworkConnect(dd.Ctx, "skupper-network", bridge.Process, &network.EndpointSettings{})
+	err = dd.ConnectContainerToNetwork("skupper-network", bridge.Process)
 	if err != nil {
-		// TODO: check behavior for what if process was already connected
-		log.Fatal("Failed to connect bridge process to skupper-network", err.Error())
+		log.Fatal("Failed to connect bridge process to skupper-network: ", err.Error())
 	}
 	return true
 }
@@ -1001,19 +1098,6 @@ func requiredArg(name string) func(*cobra.Command, []string) error {
 		}
 		return nil
 	}
-}
-
-func initDockerConfig() *DockerDetails {
-	dd := DockerDetails{}
-
-	dd.Ctx = context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		log.Fatal("Failed to create docker client: ", err.Error())
-	} else {
-		dd.Cli = cli
-	}
-	return &dd
 }
 
 func main() {
@@ -1035,6 +1119,11 @@ func main() {
 			router := Router{
 				Name: skupperName,
 				Mode: RouterModeInterior,
+			}
+			if isEdge {
+				router.Mode = RouterModeEdge
+			} else {
+				router.Mode = RouterModeInterior
 			}
 			if enableRouterConsole {
 				if routerConsoleAuthMode == string(ConsoleAuthModeInternal) || routerConsoleAuthMode == "" {
@@ -1061,22 +1150,7 @@ func main() {
 					}
 				}
 			}
-			dd := initDockerConfig()
-			imageName := "quay.io/interconnectedcloud/qdrouterd"
-
-			out, err := dd.Cli.ImagePull(dd.Ctx, imageName, types.ImagePullOptions{})
-			if err != nil {
-				log.Fatal("Failed to pull qdrouterd image: ", err.Error())
-			}
-			defer out.Close()
-
-			if !isEdge {
-				_ = initInterior(&router, dd)
-			} else {
-				router.Mode = RouterModeEdge
-				_ = initEdge(&router, dd)
-			}
-
+			skupperInit(&router)
 			fmt.Println("Skupper is now installed.  Use 'skupper status' to get more information.")
 		},
 	}
@@ -1096,7 +1170,7 @@ func main() {
 		Long:  `delete will delete any skupper related objects`,
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			deleteSkupper(initDockerConfig())
+			delete()
 		},
 	}
 
@@ -1106,7 +1180,7 @@ func main() {
 		Short: "Create a connection token file with which another skupper installation can connect to this one",
 		Args:  requiredArg("output-file"),
 		Run: func(cmd *cobra.Command, args []string) {
-			generateConnectSecret(clientIdentity, args[0], initDockerConfig())
+			generateConnectSecret(clientIdentity, args[0])
 		},
 	}
 	cmdConnectionToken.Flags().StringVarP(&clientIdentity, "client-identity", "i", "skupper", "Provide a specific identity as which connecting skupper installation will be authenticated")
@@ -1117,7 +1191,7 @@ func main() {
 		Short: "Report status of skupper installation",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			status(initDockerConfig(), listConnectors)
+			status(listConnectors)
 		},
 	}
 	cmdStatus.Flags().BoolVarP(&listConnectors, "list-connectors", "", false, "List configured outgoing connections")
@@ -1129,7 +1203,7 @@ func main() {
 		Short: "Connect this skupper installation to that which issued the specified connectionToken",
 		Args:  requiredArg("connection-token"),
 		Run: func(cmd *cobra.Command, args []string) {
-			connect(args[0], connectionName, cost, initDockerConfig())
+			connect(args[0], connectionName, cost)
 		},
 	}
 	cmdConnect.Flags().StringVarP(&connectionName, "connection-name", "", "", "Provide a specific name for the connection (used when removing it with disconnect)")
@@ -1140,7 +1214,7 @@ func main() {
 		Short: "Remove specified connection",
 		Args:  requiredArg("connection name"),
 		Run: func(cmd *cobra.Command, args []string) {
-			disconnect(args[0], initDockerConfig())
+			disconnect(args[0])
 		},
 	}
 
@@ -1168,8 +1242,7 @@ func main() {
 				Process:  bridgeProcess,
 				Protocol: bridgeProtocol,
 			}
-			dd := initDockerConfig()
-			if attachToVAN(bridge, dd) {
+			if attachToVAN(bridge) {
 				fmt.Printf("%s bridged to application network", bridgeName)
 				fmt.Println()
 			}

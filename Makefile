@@ -1,5 +1,3 @@
-VERSION := $(shell git describe --tags --dirty=-modified)
-
 all: build
 
 build:
