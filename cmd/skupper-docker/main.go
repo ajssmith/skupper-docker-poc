@@ -32,8 +32,6 @@ import (
 var (
 	version                 = "undefined"
 	hostPath                = "/tmp/skupper"
-	skupperLocalBridgePath  = hostPath + "/local-bridges/"
-	skupperRemoteBridgePath = hostPath + "/remote-bridges/"
 	skupperCertPath         = hostPath + "/qpid-dispatch-certs/"
 	skupperConnPath         = hostPath + "/connections/"
 	skupperConsoleUsersPath = hostPath + "/console-users/"
@@ -470,12 +468,6 @@ func createRouterHostFiles(volumes []string) {
 	if err := os.MkdirAll(hostPath, 0755); err != nil {
 		log.Fatal("Failed to create skupper host directory: ", err.Error())
 	}
-	if err := os.Mkdir(skupperLocalBridgePath, 0755); err != nil {
-		log.Fatal("Failed to create skupper host directory: ", err.Error())
-	}
-	if err := os.Mkdir(skupperRemoteBridgePath, 0755); err != nil {
-		log.Fatal("Failed to create skupper host directory: ", err.Error())
-	}
 	if err := os.Mkdir(skupperCertPath, 0755); err != nil {
 		log.Fatal("Failed to create skupper host directory: ", err.Error())
 	}
@@ -737,9 +729,8 @@ func delete() {
 
 	fmt.Println("Stopping skupper proxy containers...")
 	for _, container := range containers {
-		labels := container.Labels
-		for k, v := range labels {
-			if k == "skupper.io/component" && v == "proxy" {
+		if value, ok := container.Labels["skupper.io/component"]; ok {
+			if value == "proxy" {
 				err := dd.StopContainer(container.ID, 10*time.Second)
 				if err != nil {
 					log.Fatal("Failed to stop proxy container: ", err.Error())
@@ -927,6 +918,7 @@ func restartProxies(dd libdocker.Interface) {
 		labels := container.Labels
 		for k, v := range labels {
 			if k == "skupper.io/component" && v == "proxy" {
+
 				err = dd.RestartContainer(container.ID, 10*time.Second)
 				if err != nil {
 					log.Fatal("Failed to restart proxy container: ", err.Error())
@@ -934,6 +926,7 @@ func restartProxies(dd libdocker.Interface) {
 			}
 		}
 	}
+
 }
 
 func startServiceSync(dd libdocker.Interface) {
@@ -964,6 +957,11 @@ func startServiceSync(dd libdocker.Interface) {
 					Type:   dockermounttypes.TypeBind,
 					Source: skupperCertPath + "skupper",
 					Target: "/etc/messaging",
+				},
+				{
+					Type:   dockermounttypes.TypeBind,
+					Source: "/var/run",
+					Target: "/var/run",
 				},
 			},
 			Privileged: true,
@@ -1086,6 +1084,29 @@ func attachToVAN(bridge Bridge) bool {
 		log.Fatal("Failed to connect bridge process to skupper-network: ", err.Error())
 	}
 	return true
+}
+
+func listServices() {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	filters := dockerfilters.NewArgs()
+	filters.Add("label", "skupper.io/component")
+
+	containers, err := dd.ListContainers(dockertypes.ContainerListOptions{
+		Filters: filters,
+		All:     true,
+	})
+	if err != nil {
+		log.Fatal("Failed to list proxy containers: ", err.Error())
+	}
+
+	for _, container := range containers {
+		for k, v := range container.Labels {
+			if k == "skupper.io/service" {
+				log.Printf("Service %s configuration: %s \n", container.Names[0], v)
+			}
+		}
+	}
 }
 
 func requiredArg(name string) func(*cobra.Command, []string) error {
@@ -1253,8 +1274,17 @@ func main() {
 	cmdBridge.Flags().StringVarP(&bridgePort, "bridge-port", "", "", "A city in Connecticut")
 	cmdBridge.Flags().StringVarP(&bridgeProcess, "bridge-process", "", "", "Process to bind to bridge")
 
+	var cmdList = &cobra.Command{
+		Use:   "list",
+		Short: "Report list of skupper proxy services",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			listServices()
+		},
+	}
+
 	var rootCmd = &cobra.Command{Use: "skupper"}
 	rootCmd.Version = version
-	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdBridge)
+	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdBridge, cmdList)
 	rootCmd.Execute()
 }

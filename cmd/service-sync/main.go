@@ -4,21 +4,23 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"pack.ag/amqp"
+	"strconv"
+	"strings"
 	"time"
 
 	dockertypes "github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
-	dockerfilters "github.com/docker/docker/api/types/filters"
+	//dockerfilters "github.com/docker/docker/api/types/filters"
 	dockermounttypes "github.com/docker/docker/api/types/mount"
 	dockernetworktypes "github.com/docker/docker/api/types/network"
-	dockerapi "github.com/docker/docker/client"
+	//dockerapi "github.com/docker/docker/client"
 
-	"../../pkg/dockershim/libdocker"
-	//"github.com/ajssmith/skupper-docker/pkg/dockershim/libdocker"
+	"github.com/ajssmith/skupper-docker/pkg/dockershim/libdocker"
 )
 
 const (
@@ -26,31 +28,9 @@ const (
 )
 
 var (
-	hostPath                = "/tmp/skupper"
-	skupperLocalBridgePath  = hostPath + "/local-bridges/"
-	skupperRemoteBridgePath = hostPath + "/remote-bridges/"
+	hostPath        = "/tmp/skupper"
+	skupperCertPath = hostPath + "/qpid-dispatch-certs/"
 )
-
-type ProxyType string
-
-const (
-	ProxyTcp   ProxyType = "TCP"
-	ProxyUdp             = "UDP"
-	ProxyHttp            = "HTTP"
-	ProxyHttp2           = "HTTP-2"
-)
-
-type ServiceType struct {
-	Name   string
-	Bridge ProxyBridge
-	Proxy  string
-}
-
-type ProxyBridge struct {
-	Port       uint32
-	Protocol   ProxyType
-	TargetPort uint32
-}
 
 func getTlsConfig(verify bool, cert, key, ca string) (*tls.Config, error) {
 	var config tls.Config
@@ -87,99 +67,132 @@ func authOption(username string, password string) amqp.ConnOption {
 		return amqp.ConnSASLAnonymous()
 	}
 }
+func reconcile(service map[string]interface{}) {
+	var update = false
+	var port uint32
+	var protocol string
+	var targetPort uint32
 
-func attachToVAN(bridge Bridge) bool {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-	if bridge.Process != "" {
-		if bridge.Name == bridge.Process {
-			fmt.Println("The bridge and process names must be unique")
-			return false
-		}
-		_, err := dd.InspectContainer(bridge.Process)
-		if err != nil {
-			if dockerapi.IsErrNotFound(err) {
-				fmt.Println("The process to bridge was not found (need docker run?)")
-				return false
-			} else {
-				log.Fatal("Failed to retrieve process container: ", err.Error())
-			}
+	name := service["name"].(string)
+	proxy := service["proxy"].(string)
+
+	for _, bridge := range service["ports"].([]interface{}) {
+		if bridge, ok := bridge.(map[string]interface{}); ok {
+			port = bridge["port"].(uint32)
+			protocol = bridge["protocol"].(string)
+			targetPort = bridge["targetPort"].(uint32)
 		}
 	}
 
-	_, err := dd.InspectContainer(bridge.Name)
+	fields := []string{}
+	fields = append(fields, "port:"+strconv.Itoa(int(port)))
+	fields = append(fields, "protocol:"+string(protocol))
+	fields = append(fields, "targetPort:"+strconv.Itoa(int(targetPort)))
+	label := strings.Join(fields, ",")
+
+	labels := map[string]string{
+		"application":          "skupper-proxy",
+		"skupper.io/component": "proxy",
+		"skupper.io/service":   label,
+	}
+
+	current, err := dd.InspectContainer(name)
 	if err == nil {
-		fmt.Printf("A Bridge with the address %s already exists, please choose a different one", bridge.Name)
-		fmt.Println()
-	} else if dockerapi.IsErrNotFound(err) {
-		var imageName string
-		if os.Getenv("PROXY_IMAGE") != "" {
-			imageName = os.Getenv("PROXY_IMAGE")
-		} else {
-			imageName = "quay.io/ajssmith/icproxy-simple"
-		}
-		err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
-		if err != nil {
-			log.Fatal("Failed to pull proxy image: ", err.Error())
-		}
-
-		labels := getLabels("proxy", bridge)
-		bridges := []string{}
-		bridges = append(bridges, "amqp:"+bridge.Name+"=>"+bridge.Protocol+":"+bridge.Port)
-		if bridge.Process != "" {
-			bridges = append(bridges, bridge.Protocol+":"+bridge.Port+"=>amqp:"+bridge.Name)
-		}
-		bridgeCfg := strings.Join(bridges, ",")
-
-		containerCfg := &dockercontainer.Config{
-			Hostname: bridge.Name,
-			Image:    imageName,
-			Cmd: []string{
-				"node",
-				"/opt/app-root/bin/simple.js",
-				bridgeCfg},
-			Env:    proxyEnv(bridge),
-			Labels: labels,
-		}
-		hostCfg := &dockercontainer.HostConfig{
-			Mounts: []dockermounttypes.Mount{
-				{
-					Type:   dockermounttypes.TypeBind,
-					Source: skupperCertPath + "skupper",
-					Target: "/etc/messaging",
-				},
-			},
-			Privileged: true,
-		}
-		networkCfg := &dockernetworktypes.NetworkingConfig{
-			EndpointsConfig: map[string]*dockernetworktypes.EndpointSettings{
-				"skupper-network": {},
-			},
-		}
-
-		opts := &dockertypes.ContainerCreateConfig{
-			Name:             bridge.Name,
-			Config:           containerCfg,
-			HostConfig:       hostCfg,
-			NetworkingConfig: networkCfg,
-		}
-		_, err = dd.CreateContainer(*opts)
-		if err != nil {
-			log.Fatal("Failed to create proxy container: ", err.Error())
-		}
-		err = dd.StartContainer(opts.Name)
-		if err != nil {
-			log.Fatal("Failed to start proxy container: ", err.Error())
-		}
+		if val, ok := current.Config.Labels["skupper.io/service"]; ok {
+			if val != label {
+				// delete then update
+				fmt.Printf("Detected proxy config update for %s: %s\n", name, val)
+				undeploy(name, dd)
+				update = true
+			} else {
+				fmt.Printf("No update required for proxy container %s\n", name)
+			}
+		} // else why doesn't container have label?
 	} else {
+		update = true
+	}
+
+	if update {
+		deploy(name, proxy, port, labels, dd)
+	}
+}
+
+func undeploy(name string, dd libdocker.Interface) {
+
+	err := dd.StopContainer(name, 10*time.Second)
+	if err == nil {
+		if err := dd.RemoveContainer(name, dockertypes.ContainerRemoveOptions{}); err != nil {
+			log.Fatal("Failed to remove proxy container: ", err.Error())
+		}
+	}
+}
+
+func deploy(name string, proxy string, port uint32, labels map[string]string, dd libdocker.Interface) {
+
+	log.Println("Attach to VAN: ", labels["skupper.io/service"])
+
+	var imageName string
+	if os.Getenv("PROXY_IMAGE") != "" {
+		imageName = os.Getenv("PROXY_IMAGE")
+	} else {
+		imageName = "quay.io/ajssmith/icproxy-simple"
+	}
+	err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
+	if err != nil {
+		log.Fatal("Failed to pull proxy image: ", err.Error())
+	}
+
+	//labels := getLabels("proxy", bridge)
+	bridges := []string{}
+
+	//bridges = append(bridges, "amqp:"+name+"=>"+proxy+":"+strconv.Itoa(int(port)))
+	// This is for incoming, e.g. no local process for the service
+	bridges = append(bridges, proxy+":"+strconv.Itoa(int(port))+"=>amqp:"+name)
+	bridgeCfg := strings.Join(bridges, ",")
+
+	containerCfg := &dockercontainer.Config{
+		Hostname: name,
+		Image:    imageName,
+		Cmd: []string{
+			"node",
+			"/opt/app-root/bin/simple.js",
+			bridgeCfg},
+		Env:    []string{"ICPROXY_BRIDGE_HOST=" + name},
+		Labels: labels,
+	}
+	hostCfg := &dockercontainer.HostConfig{
+		Mounts: []dockermounttypes.Mount{
+			{
+				Type:   dockermounttypes.TypeBind,
+				Source: skupperCertPath + "skupper",
+				Target: "/etc/messaging",
+			},
+		},
+		Privileged: true,
+	}
+	networkCfg := &dockernetworktypes.NetworkingConfig{
+		EndpointsConfig: map[string]*dockernetworktypes.EndpointSettings{
+			"skupper-network": {},
+		},
+	}
+
+	opts := &dockertypes.ContainerCreateConfig{
+		Name:             name,
+		Config:           containerCfg,
+		HostConfig:       hostCfg,
+		NetworkingConfig: networkCfg,
+	}
+	_, err = dd.CreateContainer(*opts)
+	if err != nil {
 		log.Fatal("Failed to create proxy container: ", err.Error())
 	}
-
-	err = dd.ConnectContainerToNetwork("skupper-network", bridge.Process)
+	err = dd.StartContainer(opts.Name)
 	if err != nil {
-		log.Fatal("Failed to connect bridge process to skupper-network: ", err.Error())
+		log.Fatal("Failed to start proxy container: ", err.Error())
 	}
-	return true
+
 }
 
 func syncSender(s *amqp.Session) {
@@ -263,18 +276,7 @@ func main() {
 			if updates, ok := msg.Value.([]interface{}); ok {
 				for _, update := range updates {
 					if update, ok := update.(map[string]interface{}); ok {
-						var s ServiceType
-						s.Name = update["name"].(string)
-						s.Proxy = update["proxy"].(string)
-						for _, bridge := range update["ports"].([]interface{}) {
-							if bridge, ok := bridge.(map[string]interface{}); ok {
-								s.Bridge.Port = bridge["port"].(uint32)
-								s.Bridge.Protocol = ProxyType(bridge["protocol"].(string))
-								s.Bridge.TargetPort = bridge["targetPort"].(uint32)
-							}
-						}
-						// todo convert bridge to string and write to file
-						log.Println("Service: ", s)
+						reconcile(update)
 					}
 				}
 			} else {
