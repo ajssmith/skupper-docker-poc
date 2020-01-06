@@ -29,8 +29,8 @@ type ServicePort struct {
 type Service struct {
     Name    string        `json:"name"`
     Proxy   string        `json:"proxy"`
-    Ports   []ServicePort `json:"ports"`
     Process string        `json:"process"`
+    Ports   []ServicePort `json:"ports"`
 }
 
 type ServiceList struct {
