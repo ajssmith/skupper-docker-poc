@@ -20,32 +20,15 @@ import (
     "strings"
 )
 
-type Protocol string
-
-const (
-    ProtocolTCP   Protocol = "TCP"
-    ProtocolUDP   Protocol = "UDP"
-)
-
 type ServicePort struct {
-    Protocol   Protocol `json:"protocol"`
-    Port       int32    `json:"port"`
-    TargetPort int32    `json:"targetPort"`
+    Protocol   string `json:"protocol"`
+    Port       int32  `json:"port"`
+    TargetPort int32  `json:"targetPort"`
 }
-
-type Proxy string
-
-const (
-    ProxyAMQP  Proxy = "AMQP"
-    ProxyTCP   Proxy = "TCP"
-    ProxyUDP   Proxy = "UDP"
-    ProxyHTTP  Proxy = "HTTP"
-    ProxyHTTP2 Proxy = "HTTP2"
-)
 
 type Service struct {
     Name    string        `json:"name"`
-    Proxy   Proxy         `json:"proxy"`
+    Proxy   string        `json:"proxy"`
     Ports   []ServicePort `json:"ports"`
     Process string        `json:"process"`
 }
@@ -61,7 +44,7 @@ func (sp *ServicePort) String() string {
 func (sp *ServicePort) ServicePortLabel() string {
     fields := []string{}
     fields = append(fields, "port:"+strconv.Itoa(int(sp.Port)))
-    fields = append(fields, "protocol:"+string(sp.Protocol))
+    fields = append(fields, "protocol:"+sp.Protocol)
     fields = append(fields, "targetPort:"+strconv.Itoa(int(sp.TargetPort)))
     return strings.Join(fields, ",")
 }
