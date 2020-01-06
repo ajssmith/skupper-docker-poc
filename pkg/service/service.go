@@ -16,6 +16,8 @@ package service
 
 import (
     "fmt"
+    "strconv"
+    "strings"
 )
 
 type Protocol string
@@ -42,9 +44,10 @@ const (
 )
 
 type Service struct {
-    Name  string        `json:"name"`
-    Proxy Proxy         `json:"proxy"`
-    Ports []ServicePort `json:"ports"`
+    Name    string        `json:"name"`
+    Proxy   Proxy         `json:"proxy"`
+    Ports   []ServicePort `json:"ports"`
+    Process string        `json:"process"`
 }
 
 type ServiceList struct {
@@ -55,4 +58,11 @@ func (sp *ServicePort) String() string {
     return fmt.Sprintf("%s:%d", sp.Protocol, sp.Port)
 }
 
+func (sp *ServicePort) ServicePortLabel() string {
+    fields := []string{}
+    fields = append(fields, "port:"+strconv.Itoa(int(sp.Port)))
+    fields = append(fields, "protocol:"+string(sp.Protocol))
+    fields = append(fields, "targetPort:"+strconv.Itoa(int(sp.TargetPort)))
+    return strings.Join(fields, ",")
+}
 
