@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -15,12 +16,12 @@ import (
 
 	dockertypes "github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
-	//dockerfilters "github.com/docker/docker/api/types/filters"
 	dockermounttypes "github.com/docker/docker/api/types/mount"
 	dockernetworktypes "github.com/docker/docker/api/types/network"
-	//dockerapi "github.com/docker/docker/client"
 
 	"github.com/ajssmith/skupper-docker/pkg/dockershim/libdocker"
+	skupperservice "github.com/ajssmith/skupper-docker/pkg/service"
+	"github.com/fsnotify/fsnotify"
 )
 
 const (
@@ -67,47 +68,48 @@ func authOption(username string, password string) amqp.ConnOption {
 		return amqp.ConnSASLAnonymous()
 	}
 }
-func reconcile(service map[string]interface{}) {
+
+func getLabels(origin string, service skupperservice.Service) map[string]string {
+	serviceLabel, _ := json.Marshal(service)
+
+	return map[string]string{
+		"application":          "skupper-proxy",
+		"skupper.io/address":   service.Name,
+		"skupper.io/component": "proxy",
+		"skupper.io/service":   string(serviceLabel),
+		"skupper.io/origin":    origin,
+	}
+}
+
+func reconcile_service(origin string, service map[string]interface{}) {
 	var update = false
-	var port uint32
-	var protocol string
-	var targetPort uint32
+	var s skupperservice.Service
+	var p skupperservice.ServicePort
+
+	s.Name = service["name"].(string)
+	s.Proxy = service["proxy"].(string)
+	s.Process = ""
 
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-	name := service["name"].(string)
-	proxy := service["proxy"].(string)
-
-	for _, bridge := range service["ports"].([]interface{}) {
-		if bridge, ok := bridge.(map[string]interface{}); ok {
-			port = bridge["port"].(uint32)
-			protocol = bridge["protocol"].(string)
-			targetPort = bridge["targetPort"].(uint32)
+	for _, servicePort := range service["ports"].([]interface{}) {
+		if servicePort, ok := servicePort.(map[string]interface{}); ok {
+			p.Port = int32(servicePort["port"].(uint32))
+			p.TargetPort = int32(servicePort["targetPort"].(uint32))
+			p.Protocol = servicePort["protocol"].(string)
+			s.Ports = append(s.Ports, p)
 		}
 	}
 
-	fields := []string{}
-	fields = append(fields, "port:"+strconv.Itoa(int(port)))
-	fields = append(fields, "protocol:"+string(protocol))
-	fields = append(fields, "targetPort:"+strconv.Itoa(int(targetPort)))
-	label := strings.Join(fields, ",")
-
-	labels := map[string]string{
-		"application":          "skupper-proxy",
-		"skupper.io/component": "proxy",
-		"skupper.io/service":   label,
-	}
-
-	current, err := dd.InspectContainer(name)
+	current, err := dd.InspectContainer(s.Name)
 	if err == nil {
-		if val, ok := current.Config.Labels["skupper.io/service"]; ok {
-			if val != label {
+		if label, ok := current.Config.Labels["skupper.io/service"]; ok {
+			currentLabel, _ := json.Marshal(s)
+			if label != string(currentLabel) {
 				// delete then update
-				fmt.Printf("Detected proxy config update for %s: %s\n", name, val)
-				undeploy(name, dd)
+				fmt.Printf("Detected proxy config update for %s: %s\n", s.Name, label)
+				undeploy(s.Name, dd)
 				update = true
-			} else {
-				fmt.Printf("No update required for proxy container %s\n", name)
 			}
 		} // else why doesn't container have label?
 	} else {
@@ -115,7 +117,15 @@ func reconcile(service map[string]interface{}) {
 	}
 
 	if update {
-		deploy(name, proxy, port, labels, dd)
+		deploy(origin, s, dd)
+	}
+}
+
+func reconcile(origin string, updates []interface{}) {
+	for _, service := range updates {
+		if service, ok := service.(map[string]interface{}); ok {
+			reconcile_service(origin, service)
+		}
 	}
 }
 
@@ -129,10 +139,7 @@ func undeploy(name string, dd libdocker.Interface) {
 	}
 }
 
-func deploy(name string, proxy string, port uint32, labels map[string]string, dd libdocker.Interface) {
-
-	log.Println("Attach to VAN: ", labels["skupper.io/service"])
-
+func deploy(origin string, service skupperservice.Service, dd libdocker.Interface) {
 	var imageName string
 	if os.Getenv("PROXY_IMAGE") != "" {
 		imageName = os.Getenv("PROXY_IMAGE")
@@ -144,22 +151,23 @@ func deploy(name string, proxy string, port uint32, labels map[string]string, dd
 		log.Fatal("Failed to pull proxy image: ", err.Error())
 	}
 
-	//labels := getLabels("proxy", bridge)
+	labels := getLabels(origin, service)
 	bridges := []string{}
 
-	//bridges = append(bridges, "amqp:"+name+"=>"+proxy+":"+strconv.Itoa(int(port)))
-	// This is for incoming, e.g. no local process for the service
-	bridges = append(bridges, proxy+":"+strconv.Itoa(int(port))+"=>amqp:"+name)
+	bridges = append(bridges, string(service.Proxy)+":"+strconv.Itoa(int(service.Ports[0].Port))+"=>amqp:"+service.Name)
+	if service.Process != "" && service.Process != "none" {
+		bridges = append(bridges, "amqp:"+service.Name+"=>"+string(service.Proxy)+":"+strconv.Itoa(int(service.Ports[0].Port)))
+	}
 	bridgeCfg := strings.Join(bridges, ",")
 
 	containerCfg := &dockercontainer.Config{
-		Hostname: name,
+		Hostname: service.Name,
 		Image:    imageName,
 		Cmd: []string{
 			"node",
 			"/opt/app-root/bin/simple.js",
 			bridgeCfg},
-		Env:    []string{"ICPROXY_BRIDGE_HOST=" + name},
+		Env:    []string{"ICPROXY_BRIDGE_HOST=" + service.Name},
 		Labels: labels,
 	}
 	hostCfg := &dockercontainer.HostConfig{
@@ -179,7 +187,7 @@ func deploy(name string, proxy string, port uint32, labels map[string]string, dd
 	}
 
 	opts := &dockertypes.ContainerCreateConfig{
-		Name:             name,
+		Name:             service.Name,
 		Config:           containerCfg,
 		HostConfig:       hostCfg,
 		NetworkingConfig: networkCfg,
@@ -195,7 +203,32 @@ func deploy(name string, proxy string, port uint32, labels map[string]string, dd
 
 }
 
-func syncSender(s *amqp.Session) {
+func getLocalServices() []skupperservice.Service {
+	items := []skupperservice.Service{}
+
+	files, err := ioutil.ReadDir("/etc/messaging/services")
+	if err == nil {
+		for _, file := range files {
+			svc := skupperservice.Service{}
+			data, err := ioutil.ReadFile("/etc/messaging/services/" + file.Name())
+			if err == nil {
+				err = json.Unmarshal(data, &svc)
+				if err == nil {
+					items = append(items, svc)
+				} else {
+					fmt.Println("Error unmarshalling local services file: ", err.Error())
+				}
+			} else {
+				fmt.Println("Error reading local services file: ", err.Error())
+			}
+		}
+	} else {
+		fmt.Println("Error reading local services directory", err.Error())
+	}
+	return items
+}
+
+func syncSender(origin string, s *amqp.Session, sendLocal chan bool) {
 	var request amqp.Message
 	var properties amqp.MessageProperties
 
@@ -215,19 +248,77 @@ func syncSender(s *amqp.Session) {
 
 	properties.Subject = "service-sync-request"
 	request.Properties = &properties
-	request.Value = ""
+
 	for {
 		select {
-		case t := <-ticker.C:
-			log.Println("Skupper service sync sending request at t", t)
+		case <-sendLocal:
+			properties.Subject = "service-sync-update"
+			ls := getLocalServices()
+			for _, item := range ls {
+				fmt.Println("Local service: ", item)
+			}
+			//err = sender.Send(ctx, &request)
+		case <-ticker.C:
+			properties.Subject = "service-sync-request"
+			request.Value = ""
 			err = sender.Send(ctx, &request)
 			log.Println("Skupper service request sent")
 		}
 	}
 
 }
+
+func addLocalService(origin string, name string) {
+	var svc skupperservice.Service
+
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+	file, err := ioutil.ReadFile(name)
+	if err != nil {
+		fmt.Println("Local service file could not be read", err.Error())
+	} else {
+		err := json.Unmarshal(file, &svc)
+		if err != nil {
+			fmt.Println("Error decoding services file", err.Error())
+		}
+		deploy(origin, svc, dd)
+	}
+}
+
+func watchForLocal(origin string) {
+	var watcher *fsnotify.Watcher
+
+	watcher, _ = fsnotify.NewWatcher()
+	defer watcher.Close()
+
+	err := watcher.Add("/etc/messaging/services")
+	if err != nil {
+		log.Fatal("Could not add local services directory watcher", err.Error())
+	}
+
+	for {
+		select {
+		case event, ok := <-watcher.Events:
+			if !ok {
+				return
+			}
+			if event.Op&fsnotify.Create == fsnotify.Create {
+				log.Println("Sync local new file: ", event.Name)
+			} else if event.Op&fsnotify.Write == fsnotify.Write {
+				log.Println("Sync local modified file: ", event.Name)
+				addLocalService(origin, event.Name)
+			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
+				log.Println("Sync local removed file: ", event.Name)
+			} else {
+				return
+			}
+		}
+	}
+}
+
 func main() {
 	log.Printf("Skupper service sync starting")
+
+	localOrigin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
 
 	config, err := getTlsConfig(true, "/etc/messaging/tls.crt", "/etc/messaging/tls.key", "/etc/messaging/ca.crt")
 
@@ -242,7 +333,10 @@ func main() {
 		log.Fatal("Failed to create session:", err)
 	}
 
-	go syncSender(session)
+	sendLocal := make(chan bool)
+
+	go syncSender(localOrigin, session, sendLocal)
+	go watchForLocal(localOrigin)
 
 	ctx := context.Background()
 	receiver, err := session.NewReceiver(
@@ -269,28 +363,21 @@ func main() {
 		subject := msg.Properties.Subject
 
 		if subject == "service-sync-request" {
-			log.Println("Received service sync request")
-			// signal sender
+			sendLocal <- true
 		} else if subject == "service-sync-update" {
-			log.Println("Received service sync update")
-			if updates, ok := msg.Value.([]interface{}); ok {
-				for _, update := range updates {
-					if update, ok := update.(map[string]interface{}); ok {
-						reconcile(update)
+			if updateOrigin, ok := msg.ApplicationProperties["origin"].(string); ok {
+				if updateOrigin != localOrigin {
+					if updates, ok := msg.Value.([]interface{}); ok {
+						reconcile(updateOrigin, updates)
 					}
 				}
 			} else {
 				log.Println("Skupper service sync update type assertion error")
 			}
-
-			// if msg.ApplicationProperties.origin != origin {
-			//log.Printf("Received service-sync-update from %s: %j\n", msg.ApplicationProperties.origin, msg.Value)
-
 		} else {
 			log.Println("Service sync subject not valid")
 		}
 	}
-
 	log.Println("Skupper service sync terminating")
 
 }

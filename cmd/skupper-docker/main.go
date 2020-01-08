@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -26,6 +27,7 @@ import (
 	"github.com/skupperproject/skupper-cli/pkg/certs"
 	// note: change this when moved to skupperproject
 	"github.com/ajssmith/skupper-docker/pkg/dockershim/libdocker"
+	skupperservice "github.com/ajssmith/skupper-docker/pkg/service"
 	"github.com/spf13/cobra"
 )
 
@@ -36,6 +38,7 @@ var (
 	skupperConnPath         = hostPath + "/connections/"
 	skupperConsoleUsersPath = hostPath + "/console-users/"
 	skupperSaslConfigPath   = hostPath + "/sasl-config/"
+	skupperServicePath      = hostPath + "/services/"
 )
 
 type RouterMode string
@@ -82,13 +85,6 @@ type Router struct {
 	Console         ConsoleAuthMode
 	ConsoleUser     string
 	ConsolePassword string
-}
-
-type Bridge struct {
-	Name     string `json:"name"`
-	Port     string `json:"port"`
-	Process  string `json:"process"`
-	Protocol string `json:"protocol"`
 }
 
 type DockerDetails struct {
@@ -364,15 +360,15 @@ func syncEnv(name string) []string {
 	return envVars
 }
 
-func proxyEnv(bridge Bridge) []string {
+func proxyEnv(service skupperservice.Service) []string {
 	envVars := []string{}
-	if bridge.Process != "" {
-		envVars = append(envVars, "ICPROXY_BRIDGE_HOST="+bridge.Process)
+	if service.Process != "" {
+		envVars = append(envVars, "ICPROXY_BRIDGE_HOST="+service.Process)
 	}
 	return envVars
 }
 
-func getLabels(component string, bridge Bridge) map[string]string {
+func getLabels(component string, service skupperservice.Service) map[string]string {
 	application := "skupper"
 	if component == "router" {
 		//the automeshing function of the router image expects the application
@@ -387,7 +383,7 @@ func getLabels(component string, bridge Bridge) map[string]string {
 		return map[string]string{
 			"application":          "skupper-proxy",
 			"skupper.io/component": component,
-			"skupper.io/process":   bridge.Process,
+			"skupper.io/process":   service.Process,
 		}
 	} else if component == "network" {
 		return map[string]string{
@@ -477,6 +473,9 @@ func createRouterHostFiles(volumes []string) {
 	if err := os.Mkdir(skupperConsoleUsersPath, 0777); err != nil {
 		log.Fatal("Failed to create skupper host directory: ", err.Error())
 	}
+	if err := os.Mkdir(skupperServicePath, 0755); err != nil {
+		log.Fatal("Failed to create skupper host directory: ", err.Error())
+	}
 	if err := os.Mkdir(skupperSaslConfigPath, 0755); err != nil {
 		log.Fatal("Failed to create skupper host directory: ", err.Error())
 	}
@@ -521,7 +520,7 @@ func routerHostConfig(router *Router) *dockercontainer.HostConfig {
 func routerContainerConfig(router *Router) *dockercontainer.Config {
 	var image string
 
-	labels := getLabels("router", Bridge{})
+	labels := getLabels("router", skupperservice.Service{})
 
 	if os.Getenv("QDROUTERD_IMAGE") != "" {
 		image = os.Getenv("QDROUTERD_IMAGE")
@@ -931,6 +930,9 @@ func restartProxies(dd libdocker.Interface) {
 
 func startServiceSync(dd libdocker.Interface) {
 	_, err := dd.InspectContainer("skupper-service-sync")
+
+	origin := randomId(10)
+
 	if err == nil {
 		fmt.Println("Container skupper-service-syncy already exists")
 		return
@@ -950,6 +952,7 @@ func startServiceSync(dd libdocker.Interface) {
 			Hostname: "skupper-service-sync",
 			Image:    imageName,
 			Cmd:      []string{"app"},
+			Env:      []string{"SKUPPER_SERVICE_SYNC_ORIGIN=" + origin},
 		}
 		hostCfg := &dockercontainer.HostConfig{
 			Mounts: []dockermounttypes.Mount{
@@ -957,6 +960,11 @@ func startServiceSync(dd libdocker.Interface) {
 					Type:   dockermounttypes.TypeBind,
 					Source: skupperCertPath + "skupper",
 					Target: "/etc/messaging",
+				},
+				{
+					Type:   dockermounttypes.TypeBind,
+					Source: skupperServicePath,
+					Target: "/etc/messaging/services",
 				},
 				{
 					Type:   dockermounttypes.TypeBind,
@@ -992,96 +1000,75 @@ func startServiceSync(dd libdocker.Interface) {
 
 }
 
-func attachToVAN(bridge Bridge) bool {
+func attachServiceToVAN(service skupperservice.Service) bool {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-	if bridge.Process != "" {
-		if bridge.Name == bridge.Process {
-			fmt.Println("The bridge and process names must be unique")
+	// check that init has fun first by inspecting skupper router container
+	_, err := dd.InspectContainer("skupper-router")
+	if err != nil {
+		if dockerapi.IsErrNotFound(err) {
+			fmt.Println("Router container does not exist (need init?): " + err.Error())
+		} else {
+			fmt.Println("Error retrieving router container: " + err.Error())
+		}
+		return false
+	}
+
+	// check that a service with that name already has been attached to the VAN
+	_, err = ioutil.ReadFile(skupperServicePath + service.Name)
+	if err == nil {
+		fmt.Printf("Service name %s already exists\n", service.Name)
+		return false
+	}
+
+	if service.Process != "" {
+		if service.Name == service.Process {
+			fmt.Println("The service and process names must be unique")
 			return false
 		}
-		_, err := dd.InspectContainer(bridge.Process)
+
+		_, err := dd.InspectContainer(service.Process)
 		if err != nil {
 			if dockerapi.IsErrNotFound(err) {
-				fmt.Println("The process to bridge was not found (need docker run?)")
-				return false
+				fmt.Println("Service process does not exist: " + err.Error())
 			} else {
-				log.Fatal("Failed to retrieve process container: ", err.Error())
+				fmt.Println("Error retrieving service process container: " + err.Error())
 			}
-		}
-	}
-
-	_, err := dd.InspectContainer(bridge.Name)
-	if err == nil {
-		fmt.Printf("A Bridge with the address %s already exists, please choose a different one", bridge.Name)
-		fmt.Println()
-	} else if dockerapi.IsErrNotFound(err) {
-		var imageName string
-		if os.Getenv("PROXY_IMAGE") != "" {
-			imageName = os.Getenv("PROXY_IMAGE")
-		} else {
-			imageName = "quay.io/ajssmith/icproxy-simple"
-		}
-		err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
-		if err != nil {
-			log.Fatal("Failed to pull proxy image: ", err.Error())
-		}
-
-		labels := getLabels("proxy", bridge)
-		bridges := []string{}
-		bridges = append(bridges, "amqp:"+bridge.Name+"=>"+bridge.Protocol+":"+bridge.Port)
-		if bridge.Process != "" {
-			bridges = append(bridges, bridge.Protocol+":"+bridge.Port+"=>amqp:"+bridge.Name)
-		}
-		bridgeCfg := strings.Join(bridges, ",")
-
-		containerCfg := &dockercontainer.Config{
-			Hostname: bridge.Name,
-			Image:    imageName,
-			Cmd: []string{
-				"node",
-				"/opt/app-root/bin/simple.js",
-				bridgeCfg},
-			Env:    proxyEnv(bridge),
-			Labels: labels,
-		}
-		hostCfg := &dockercontainer.HostConfig{
-			Mounts: []dockermounttypes.Mount{
-				{
-					Type:   dockermounttypes.TypeBind,
-					Source: skupperCertPath + "skupper",
-					Target: "/etc/messaging",
-				},
-			},
-			Privileged: true,
-		}
-		networkCfg := &dockernetworktypes.NetworkingConfig{
-			EndpointsConfig: map[string]*dockernetworktypes.EndpointSettings{
-				"skupper-network": {},
-			},
-		}
-
-		opts := &dockertypes.ContainerCreateConfig{
-			Name:             bridge.Name,
-			Config:           containerCfg,
-			HostConfig:       hostCfg,
-			NetworkingConfig: networkCfg,
-		}
-		_, err = dd.CreateContainer(*opts)
-		if err != nil {
-			log.Fatal("Failed to create proxy container: ", err.Error())
-		}
-		err = dd.StartContainer(opts.Name)
-		if err != nil {
-			log.Fatal("Failed to start proxy container: ", err.Error())
+			return false
 		}
 	} else {
-		log.Fatal("Failed to create proxy container: ", err.Error())
+		service.Process = "none"
 	}
 
-	err = dd.ConnectContainerToNetwork("skupper-network", bridge.Process)
+	data, _ := json.Marshal(service)
+	if err = ioutil.WriteFile(skupperServicePath+service.Name, data, 0755); err != nil {
+		log.Fatal("Failed to write services file: ", err.Error())
+	}
+
+	return true
+}
+
+func detachServiceFromVAN(name string) bool {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	// check that init has fun first by inspecting skupper router container
+	_, err := dd.InspectContainer("skupper-router")
 	if err != nil {
-		log.Fatal("Failed to connect bridge process to skupper-network: ", err.Error())
+		if dockerapi.IsErrNotFound(err) {
+			fmt.Println("Router container does not exist (need init?): " + err.Error())
+		} else {
+			fmt.Println("Error retrieving router container: " + err.Error())
+		}
+		return false
+	}
+
+	// check that a service with that name already has been attached to the VAN
+	_, err = ioutil.ReadFile(skupperServicePath + name)
+	if err != nil {
+		fmt.Printf("Service name %s does not exist\n", name)
+		return false
+	} else {
+		os.Remove(skupperServicePath + name)
 	}
 	return true
 }
@@ -1248,31 +1235,55 @@ func main() {
 		},
 	}
 
-	var bridgeName string
-	var bridgeProtocol string
-	var bridgePort string
-	var bridgeProcess string
-	var cmdBridge = &cobra.Command{
-		Use:   "bridge",
-		Short: "Bridge address and process (optionally) to the VAN installation",
+	var serviceName string
+	var serviceProtocol string
+	var serviceProxy string
+	var servicePort string
+	var serviceTargetPort string
+	var serviceProcess string
+	var cmdAttach = &cobra.Command{
+		Use:   "attach",
+		Short: "Service address and process (optionally) to the VAN installation",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			bridge := Bridge{
-				Name:     bridgeName,
-				Port:     bridgePort,
-				Process:  bridgeProcess,
-				Protocol: bridgeProtocol,
+			port, _ := strconv.Atoi(servicePort)
+			targetPort, _ := strconv.Atoi(serviceTargetPort)
+			svc := skupperservice.Service{
+				Name:  serviceName,
+				Proxy: serviceProxy,
+				Ports: []skupperservice.ServicePort{
+					{
+						Port:       int32(port),
+						Protocol:   serviceProtocol,
+						TargetPort: int32(targetPort),
+					},
+				},
+				Process: serviceProcess,
 			}
-			if attachToVAN(bridge) {
-				fmt.Printf("%s bridged to application network", bridgeName)
+			if attachServiceToVAN(svc) {
+				fmt.Printf("Service %s attached to application network", serviceName)
 				fmt.Println()
 			}
 		},
 	}
-	cmdBridge.Flags().StringVarP(&bridgeName, "bridge-name", "", "", "Provide a unique name for the VAN address (used when removing it with leave)")
-	cmdBridge.Flags().StringVarP(&bridgeProtocol, "bridge-protocol", "", "", "Bridge protocol one of tcp, udp, http, http-2, amqp")
-	cmdBridge.Flags().StringVarP(&bridgePort, "bridge-port", "", "", "A city in Connecticut")
-	cmdBridge.Flags().StringVarP(&bridgeProcess, "bridge-process", "", "", "Process to bind to bridge")
+	cmdAttach.Flags().StringVarP(&serviceName, "service-name", "", "", "Provide a unique name for the VAN address")
+	cmdAttach.Flags().StringVarP(&serviceProtocol, "service-protocol", "", "", "Service protocol one of TCP, UDP")
+	cmdAttach.Flags().StringVarP(&serviceProxy, "service-proxy", "", "", "Service proxy one of tcp, udp, http, http-2, amqp")
+	cmdAttach.Flags().StringVarP(&servicePort, "service-port", "", "", "Service port if applicable")
+	cmdAttach.Flags().StringVarP(&serviceTargetPort, "service-target-port", "", "", "Service target port if applicable")
+	cmdAttach.Flags().StringVarP(&serviceProcess, "service-process", "", "", "Optional local process to bind to service")
+
+	var cmdDetach = &cobra.Command{
+		Use:   "detach",
+		Short: "Service address to remove from the VAN installation",
+		Args:  cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			if detachServiceFromVAN(serviceName) {
+				fmt.Printf("Service %s detached from application network\n", serviceName)
+			}
+		},
+	}
+	cmdDetach.Flags().StringVarP(&serviceName, "service-name", "", "", "Provide service name to detach the VAN address")
 
 	var cmdList = &cobra.Command{
 		Use:   "list",
@@ -1285,6 +1296,6 @@ func main() {
 
 	var rootCmd = &cobra.Command{Use: "skupper"}
 	rootCmd.Version = version
-	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdBridge, cmdList)
+	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdAttach, cmdDetach, cmdList)
 	rootCmd.Execute()
 }
