@@ -14,33 +14,30 @@ limitations under the License.
 
 package service
 
-import (
-	"fmt"
-	"strconv"
-	"strings"
-)
-
-type ServicePort struct {
-	Protocol   string `json:"protocol"`
-	Port       int32  `json:"port"`
-	TargetPort int32  `json:"targetPort"`
+type ExposeOptions struct {
+    Protocol   string
+    Address    string
+    Port       int
+    TargetPort int
+    Headless   bool
 }
 
 type Service struct {
-	Name    string        `json:"name"`
-	Proxy   string        `json:"proxy"`
-	Process string        `json:"process"`
-	Ports   []ServicePort `json:"ports"`
+    Address  string          `json:"address"`
+	Protocol string          `json:"protocol"`
+	Port     int             `json:"port"`
+    Headless *Headless       `json:"headles,omitempty"`
+    Targets  []ServiceTarget `json:"targets,omitempty"`
 }
 
-func (sp *ServicePort) String() string {
-	return fmt.Sprintf("%s:%d", sp.Protocol, sp.Port)
+type ServiceTarget struct {
+    Name       string `json:"name"`
+    Selector   string `json:"selector"`
+    TargetPort int    `json:"targetPort,omitempty"`
 }
 
-func (sp *ServicePort) ServicePortLabel() string {
-	fields := []string{}
-	fields = append(fields, "port:"+strconv.Itoa(int(sp.Port)))
-	fields = append(fields, "protocol:"+sp.Protocol)
-	fields = append(fields, "targetPort:"+strconv.Itoa(int(sp.TargetPort)))
-	return strings.Join(fields, ",")
+type Headless struct {
+    Name       string `json:"name"`
+    Size       int    `json:"size"`
+    TargetPort int    `json:"targetPort,omitempty"`
 }
