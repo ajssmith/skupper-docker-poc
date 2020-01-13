@@ -1,4 +1,4 @@
-IMAGE := quay.io/ajssmith/service-sync-go
+IMAGE := quay.io/ajssmith/skupper-docker-proxy-controller
 
 .PHONY: build
 build:

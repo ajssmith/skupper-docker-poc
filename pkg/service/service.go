@@ -15,29 +15,29 @@ limitations under the License.
 package service
 
 type ExposeOptions struct {
-    Protocol   string
-    Address    string
-    Port       int
-    TargetPort int
-    Headless   bool
+	Protocol   string
+	Address    string
+	Port       int
+	TargetPort int
+	Headless   bool
 }
 
 type Service struct {
-    Address  string          `json:"address"`
+	Address  string          `json:"address"`
 	Protocol string          `json:"protocol"`
 	Port     int             `json:"port"`
-    Headless *Headless       `json:"headles,omitempty"`
-    Targets  []ServiceTarget `json:"targets,omitempty"`
+	Headless *Headless       `json:"headles,omitempty"`
+	Targets  []ServiceTarget `json:"targets,omitempty"`
 }
 
 type ServiceTarget struct {
-    Name       string `json:"name"`
-    Selector   string `json:"selector"`
-    TargetPort int    `json:"targetPort,omitempty"`
+	Name       string `json:"name"`
+	Selector   string `json:"selector"`
+	TargetPort int    `json:"targetPort,omitempty"`
 }
 
 type Headless struct {
-    Name       string `json:"name"`
-    Size       int    `json:"size"`
-    TargetPort int    `json:"targetPort,omitempty"`
+	Name       string `json:"name"`
+	Size       int    `json:"size"`
+	TargetPort int    `json:"targetPort,omitempty"`
 }

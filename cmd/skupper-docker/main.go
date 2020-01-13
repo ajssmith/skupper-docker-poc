@@ -362,8 +362,8 @@ func syncEnv(name string) []string {
 
 func proxyEnv(service skupperservice.Service) []string {
 	envVars := []string{}
-	if service.Process != "" {
-		envVars = append(envVars, "ICPROXY_BRIDGE_HOST="+service.Process)
+	if service.Targets[0].Name != "" {
+		envVars = append(envVars, "ICPROXY_BRIDGE_HOST="+service.Targets[0].Name)
 	}
 	return envVars
 }
@@ -383,7 +383,7 @@ func getLabels(component string, service skupperservice.Service) map[string]stri
 		return map[string]string{
 			"application":          "skupper-proxy",
 			"skupper.io/component": component,
-			"skupper.io/process":   service.Process,
+			"skupper.io/process":   service.Targets[0].Name,
 		}
 	} else if component == "network" {
 		return map[string]string{
@@ -641,9 +641,9 @@ func restartRouterContainer(dd libdocker.Interface) {
 			log.Fatal("Failed to re-start router container: ", err.Error())
 		}
 
-		err = dd.RestartContainer("skupper-service-sync", 10*time.Second)
+		err = dd.RestartContainer("skupper-proxy-controller", 10*time.Second)
 		if err != nil {
-			log.Fatal("Failed to re-start sercie sync container: ", err.Error())
+			log.Fatal("Failed to re-start skupper-proxy-controller container: ", err.Error())
 		}
 		restartProxies(dd)
 	}
@@ -702,15 +702,15 @@ func status(listConnectors bool) {
 func delete() {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-	_, err := dd.InspectContainer("skupper-service-sync")
+	_, err := dd.InspectContainer("skupper-proxy-controller")
 	if err == nil {
-		dd.StopContainer("skupper-service-sync", 10*time.Second)
+		dd.StopContainer("skupper-proxy-controller", 10*time.Second)
 		if err != nil {
-			log.Fatal("Failed to stop service sync container: ", err.Error())
+			log.Fatal("Failed to stop proxy controller container: ", err.Error())
 		}
-		err = dd.RemoveContainer("skupper-service-sync", dockertypes.ContainerRemoveOptions{})
+		err = dd.RemoveContainer("skupper-proxy-controller", dockertypes.ContainerRemoveOptions{})
 		if err != nil {
-			log.Fatal("Failed to remove service sync container: ", err.Error())
+			log.Fatal("Failed to remove proxy controller container: ", err.Error())
 		}
 	}
 
@@ -929,19 +929,19 @@ func restartProxies(dd libdocker.Interface) {
 }
 
 func startServiceSync(dd libdocker.Interface) {
-	_, err := dd.InspectContainer("skupper-service-sync")
+	_, err := dd.InspectContainer("skupper-proxy-controller")
 
 	origin := randomId(10)
 
 	if err == nil {
-		fmt.Println("Container skupper-service-syncy already exists")
+		fmt.Println("Container skupper-proxy-controller already exists")
 		return
 	} else if dockerapi.IsErrNotFound(err) {
 		var imageName string
 		if os.Getenv("SERVICE_SYNC_IMAGE") != "" {
-			imageName = os.Getenv("SERVICE_SYNC_IMAGE")
+			imageName = os.Getenv("PROXY_CONTROLLER_IMAGE")
 		} else {
-			imageName = "quay.io/ajssmith/service-sync-go"
+			imageName = "quay.io/ajssmith/skupper-docker-proxy-controller"
 		}
 		err := dd.PullImage(imageName, dockertypes.AuthConfig{}, dockertypes.ImagePullOptions{})
 		if err != nil {
@@ -949,7 +949,7 @@ func startServiceSync(dd libdocker.Interface) {
 		}
 
 		containerCfg := &dockercontainer.Config{
-			Hostname: "skupper-service-sync",
+			Hostname: "skupper-proxy-controller",
 			Image:    imageName,
 			Cmd:      []string{"app"},
 			Env:      []string{"SKUPPER_SERVICE_SYNC_ORIGIN=" + origin},
@@ -980,27 +980,27 @@ func startServiceSync(dd libdocker.Interface) {
 			},
 		}
 		opts := &dockertypes.ContainerCreateConfig{
-			Name:             "skupper-service-sync",
+			Name:             "skupper-proxy-controller",
 			Config:           containerCfg,
 			HostConfig:       hostCfg,
 			NetworkingConfig: networkCfg,
 		}
 		_, err = dd.CreateContainer(*opts)
 		if err != nil {
-			log.Fatal("Failed to create service sync container: ", err.Error())
+			log.Fatal("Failed to create proxy controller container: ", err.Error())
 		}
 		err = dd.StartContainer(opts.Name)
 		if err != nil {
-			log.Fatal("Failed to start service sync container: ", err.Error())
+			log.Fatal("Failed to start proxy controller container: ", err.Error())
 		}
 
 	} else {
-		log.Fatal("Failed to create skupper-service-sync container")
+		log.Fatal("Failed to create skupper-proxy-controller container")
 	}
 
 }
 
-func attachServiceToVAN(service skupperservice.Service) bool {
+func expose(targetName string, options skupperservice.ExposeOptions) {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
 	// check that init has fun first by inspecting skupper router container
@@ -1011,44 +1011,64 @@ func attachServiceToVAN(service skupperservice.Service) bool {
 		} else {
 			fmt.Println("Error retrieving router container: " + err.Error())
 		}
-		return false
+		return
 	}
 
 	// check that a service with that name already has been attached to the VAN
-	_, err = ioutil.ReadFile(skupperServicePath + service.Name)
+	_, err = ioutil.ReadFile(skupperServicePath + options.Address)
 	if err == nil {
-		fmt.Printf("Service name %s already exists\n", service.Name)
-		return false
+		// TODO: Deal with update case , read in json file, decode and update
+		fmt.Printf("Expose target name %s already exists\n", targetName)
+		return
 	}
 
-	if service.Process != "" {
-		if service.Name == service.Process {
-			fmt.Println("The service and process names must be unique")
-			return false
-		}
+	if targetName == options.Address {
+		fmt.Println("The exposed address and container target name must be different")
+		return
+	} else {
+		// TODO: container exists but exited, not running? restart it?
+		_, err := dd.InspectContainer(targetName)
 
-		_, err := dd.InspectContainer(service.Process)
 		if err != nil {
 			if dockerapi.IsErrNotFound(err) {
-				fmt.Println("Service process does not exist: " + err.Error())
+				fmt.Println("Target container does not exist: " + err.Error())
 			} else {
-				fmt.Println("Error retrieving service process container: " + err.Error())
+				fmt.Println("Error retrieving service target container: " + err.Error())
 			}
-			return false
+			return
 		}
+	}
+
+	serviceTarget := skupperservice.ServiceTarget{
+		Name:       targetName,
+		Selector:   "",
+		TargetPort: options.TargetPort,
+	}
+
+	serviceDef := skupperservice.Service{
+		Address:  options.Address,
+		Protocol: options.Protocol,
+		Port:     options.Port,
+		Targets: []skupperservice.ServiceTarget{
+			serviceTarget,
+		},
+	}
+
+	encoded, err := json.Marshal(serviceDef)
+
+	if err != nil {
+		fmt.Println("Failed to create json for service definition: ", err.Error())
+		return
 	} else {
-		service.Process = "none"
+		if err = ioutil.WriteFile(skupperServicePath+options.Address, encoded, 0755); err != nil {
+			log.Fatal("Failed to write services file: ", err.Error())
+		}
 	}
 
-	data, _ := json.Marshal(service)
-	if err = ioutil.WriteFile(skupperServicePath+service.Name, data, 0755); err != nil {
-		log.Fatal("Failed to write services file: ", err.Error())
-	}
-
-	return true
+	return
 }
 
-func detachServiceFromVAN(name string) bool {
+func unexpose(address string) bool {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
 	// check that init has fun first by inspecting skupper router container
@@ -1063,17 +1083,18 @@ func detachServiceFromVAN(name string) bool {
 	}
 
 	// check that a service with that name already has been attached to the VAN
-	_, err = ioutil.ReadFile(skupperServicePath + name)
+	_, err = ioutil.ReadFile(skupperServicePath + address)
 	if err != nil {
-		fmt.Printf("Service name %s does not exist\n", name)
+		fmt.Printf("Service address %s does not exist\n", address)
 		return false
 	} else {
-		os.Remove(skupperServicePath + name)
+		// remove the service definition file
+		os.Remove(skupperServicePath + address)
 	}
 	return true
 }
 
-func listServices() {
+func listServiceDefinitions() {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
 	filters := dockerfilters.NewArgs()
@@ -1235,67 +1256,44 @@ func main() {
 		},
 	}
 
-	var serviceName string
-	var serviceProtocol string
-	var serviceProxy string
-	var servicePort string
-	var serviceTargetPort string
-	var serviceProcess string
-	var cmdAttach = &cobra.Command{
-		Use:   "attach",
-		Short: "Service address and process (optionally) to the VAN installation",
-		Args:  cobra.NoArgs,
+	exposeOptions := skupperservice.ExposeOptions{}
+	var cmdExpose = &cobra.Command{
+		Use:   "expose <name>",
+		Short: "Expose a skupper address and optionally a local target to the skupper network",
+		Args:  requiredArg("address"),
 		Run: func(cmd *cobra.Command, args []string) {
-			port, _ := strconv.Atoi(servicePort)
-			targetPort, _ := strconv.Atoi(serviceTargetPort)
-			svc := skupperservice.Service{
-				Name:  serviceName,
-				Proxy: serviceProxy,
-				Ports: []skupperservice.ServicePort{
-					{
-						Port:       int32(port),
-						Protocol:   serviceProtocol,
-						TargetPort: int32(targetPort),
-					},
-				},
-				Process: serviceProcess,
-			}
-			if attachServiceToVAN(svc) {
-				fmt.Printf("Service %s attached to application network", serviceName)
-				fmt.Println()
-			}
+			expose(args[0], exposeOptions)
 		},
 	}
-	cmdAttach.Flags().StringVarP(&serviceName, "service-name", "", "", "Provide a unique name for the VAN address")
-	cmdAttach.Flags().StringVarP(&serviceProtocol, "service-protocol", "", "", "Service protocol one of TCP, UDP")
-	cmdAttach.Flags().StringVarP(&serviceProxy, "service-proxy", "", "", "Service proxy one of tcp, udp, http, http-2, amqp")
-	cmdAttach.Flags().StringVarP(&servicePort, "service-port", "", "", "Service port if applicable")
-	cmdAttach.Flags().StringVarP(&serviceTargetPort, "service-target-port", "", "", "Service target port if applicable")
-	cmdAttach.Flags().StringVarP(&serviceProcess, "service-process", "", "", "Optional local process to bind to service")
+	cmdExpose.Flags().StringVar(&(exposeOptions.Protocol), "protocol", "tcp", "Protocol to proxy (tcp, http or http2)")
+	cmdExpose.Flags().StringVar(&(exposeOptions.Address), "address", "", "Skupper address to expose as")
+	cmdExpose.Flags().IntVar(&(exposeOptions.Port), "port", 0, "Port to expose on")
+	cmdExpose.Flags().IntVar(&(exposeOptions.TargetPort), "target-port", 0, "Port to target on pods")
+	cmdExpose.Flags().BoolVar(&(exposeOptions.Headless), "headless", false, "Expose through headless service (valid only for statefulset target)")
 
-	var cmdDetach = &cobra.Command{
-		Use:   "detach",
-		Short: "Service address to remove from the VAN installation",
-		Args:  cobra.NoArgs,
+	var cmdUnexpose = &cobra.Command{
+		Use:   "unexpose <name>",
+		Short: "Unexpose container previously exposed via skupper address",
+		Args:  requiredArg("address"),
 		Run: func(cmd *cobra.Command, args []string) {
-			if detachServiceFromVAN(serviceName) {
-				fmt.Printf("Service %s detached from application network\n", serviceName)
-			}
+			unexpose(args[0])
+			//if unexpose(aunexposeAddress) {
+			//	fmt.Printf("Address %s detached from application network\n", unexposeAddress)
+			//}
 		},
 	}
-	cmdDetach.Flags().StringVarP(&serviceName, "service-name", "", "", "Provide service name to detach the VAN address")
 
-	var cmdList = &cobra.Command{
-		Use:   "list",
-		Short: "Report list of skupper proxy services",
+	var cmdListExposed = &cobra.Command{
+		Use:   "list-exposed",
+		Short: "List services exposed over the skupper network",
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
-			listServices()
+			listServiceDefinitions()
 		},
 	}
 
 	var rootCmd = &cobra.Command{Use: "skupper"}
 	rootCmd.Version = version
-	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdAttach, cmdDetach, cmdList)
+	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdExpose, cmdUnexpose, cmdListExposed)
 	rootCmd.Execute()
 }

@@ -29,9 +29,15 @@ const (
 )
 
 var (
-	hostPath        = "/tmp/skupper"
-	skupperCertPath = hostPath + "/qpid-dispatch-certs/"
+	hostPath            = "/tmp/skupper"
+	skupperCertPath     = hostPath + "/qpid-dispatch-certs/"
+	skupperServicesPath = "/etc/messaging/services/"
 )
+
+func describe(i interface{}) {
+	fmt.Printf("(%v, %T)\n", i, i)
+	fmt.Println()
+}
 
 func getTlsConfig(verify bool, cert, key, ca string) (*tls.Config, error) {
 	var config tls.Config
@@ -69,63 +75,39 @@ func authOption(username string, password string) amqp.ConnOption {
 	}
 }
 
-func getLabels(origin string, service skupperservice.Service) map[string]string {
-	serviceLabel, _ := json.Marshal(service)
-
+func getLabels(origin string, service skupperservice.Service, isLocal bool) map[string]string {
+	target := ""
+	if isLocal {
+		target = service.Targets[0].Name
+	}
 	return map[string]string{
 		"application":          "skupper-proxy",
-		"skupper.io/address":   service.Name,
+		"skupper.io/address":   service.Address,
+		"skupper.io/target":    target,
 		"skupper.io/component": "proxy",
-		"skupper.io/service":   string(serviceLabel),
 		"skupper.io/origin":    origin,
 	}
 }
 
-func reconcile_service(origin string, service map[string]interface{}) {
-	var update = false
-	var s skupperservice.Service
-	var p skupperservice.ServicePort
-
-	s.Name = service["name"].(string)
-	s.Proxy = service["proxy"].(string)
-	s.Process = ""
+func reconcile_service(origin string, service skupperservice.Service) {
+	var update = true
 
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
-	for _, servicePort := range service["ports"].([]interface{}) {
-		if servicePort, ok := servicePort.(map[string]interface{}); ok {
-			p.Port = int32(servicePort["port"].(uint32))
-			p.TargetPort = int32(servicePort["targetPort"].(uint32))
-			p.Protocol = servicePort["protocol"].(string)
-			s.Ports = append(s.Ports, p)
-		}
-	}
-
-	current, err := dd.InspectContainer(s.Name)
+	_, err := dd.InspectContainer(service.Address)
 	if err == nil {
-		if label, ok := current.Config.Labels["skupper.io/service"]; ok {
-			currentLabel, _ := json.Marshal(s)
-			if label != string(currentLabel) {
-				// delete then update
-				fmt.Printf("Detected proxy config update for %s: %s\n", s.Name, label)
-				undeploy(s.Name, dd)
-				update = true
-			}
-		} // else why doesn't container have label?
-	} else {
-		update = true
+		return
 	}
 
 	if update {
-		deploy(origin, s, dd)
+		deploy(origin, service, dd)
 	}
 }
 
-func reconcile(origin string, updates []interface{}) {
-	for _, service := range updates {
-		if service, ok := service.(map[string]interface{}); ok {
-			reconcile_service(origin, service)
-		}
+func reconcile(origin string, svcDefs []skupperservice.Service) {
+	for _, service := range svcDefs {
+		fmt.Println("Reconcile service: ", service)
+		reconcile_service(origin, service)
 	}
 }
 
@@ -140,6 +122,14 @@ func undeploy(name string, dd libdocker.Interface) {
 }
 
 func deploy(origin string, service skupperservice.Service, dd libdocker.Interface) {
+	//TODO: checking origing can drive local versus remote, e.g. remote has no target
+	isLocal := true
+
+	myOrigin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
+	if origin != myOrigin {
+		isLocal = false
+	}
+
 	var imageName string
 	if os.Getenv("PROXY_IMAGE") != "" {
 		imageName = os.Getenv("PROXY_IMAGE")
@@ -151,23 +141,36 @@ func deploy(origin string, service skupperservice.Service, dd libdocker.Interfac
 		log.Fatal("Failed to pull proxy image: ", err.Error())
 	}
 
-	labels := getLabels(origin, service)
-	bridges := []string{}
+	// attach local target to the skupper network
+	if isLocal {
+		//	if service.Targets[0].Name != "" {
+		err := dd.ConnectContainerToNetwork("skupper-network", service.Targets[0].Name)
+		if err != nil {
+			log.Fatal("Failed to attach target container to skupper network: ", err.Error())
+		}
+	}
 
-	bridges = append(bridges, string(service.Proxy)+":"+strconv.Itoa(int(service.Ports[0].Port))+"=>amqp:"+service.Name)
-	if service.Process != "" && service.Process != "none" {
-		bridges = append(bridges, "amqp:"+service.Name+"=>"+string(service.Proxy)+":"+strconv.Itoa(int(service.Ports[0].Port)))
+	labels := getLabels(origin, service, isLocal)
+	bridges := []string{}
+	env := []string{}
+
+	bridges = append(bridges, service.Protocol+":"+strconv.Itoa(int(service.Port))+"=>amqp:"+service.Address)
+	if isLocal {
+		//	if service.Targets[0].Name != "" {
+		bridges = append(bridges, "amqp:"+service.Address+"=>"+service.Protocol+":"+strconv.Itoa(int(service.Targets[0].TargetPort)))
+		env = append(env, "ICPROXY_BRIDGE_HOST="+service.Targets[0].Name)
 	}
 	bridgeCfg := strings.Join(bridges, ",")
 
+	//Env:    []string{"ICPROXY_BRIDGE_HOST=" + service.Targets[0].Name},
 	containerCfg := &dockercontainer.Config{
-		Hostname: service.Name,
+		Hostname: service.Address,
 		Image:    imageName,
 		Cmd: []string{
 			"node",
 			"/opt/app-root/bin/simple.js",
 			bridgeCfg},
-		Env:    []string{"ICPROXY_BRIDGE_HOST=" + service.Name},
+		Env:    env,
 		Labels: labels,
 	}
 	hostCfg := &dockercontainer.HostConfig{
@@ -187,7 +190,7 @@ func deploy(origin string, service skupperservice.Service, dd libdocker.Interfac
 	}
 
 	opts := &dockertypes.ContainerCreateConfig{
-		Name:             service.Name,
+		Name:             service.Address,
 		Config:           containerCfg,
 		HostConfig:       hostCfg,
 		NetworkingConfig: networkCfg,
@@ -228,9 +231,11 @@ func getLocalServices() []skupperservice.Service {
 	return items
 }
 
-func syncSender(origin string, s *amqp.Session, sendLocal chan bool) {
+func syncSender(s *amqp.Session, sendLocal chan bool) {
 	var request amqp.Message
 	var properties amqp.MessageProperties
+
+	myOrigin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
 
 	ctx := context.Background()
 	sender, err := s.NewSender(
@@ -248,16 +253,28 @@ func syncSender(origin string, s *amqp.Session, sendLocal chan bool) {
 
 	properties.Subject = "service-sync-request"
 	request.Properties = &properties
+	request.ApplicationProperties = make(map[string]interface{})
+	request.ApplicationProperties["origin"] = myOrigin
 
 	for {
 		select {
 		case <-sendLocal:
 			properties.Subject = "service-sync-update"
-			ls := getLocalServices()
-			for _, item := range ls {
-				fmt.Println("Local service: ", item)
+			svcDefs := getLocalServices()
+			encoded, err := json.Marshal(svcDefs)
+			if err != nil {
+				fmt.Println("Failed to create json for service definition sync: ", err.Error())
+				return
+			} else {
+				fmt.Println("Local services: ", string(encoded))
 			}
-			//err = sender.Send(ctx, &request)
+			request.Value = string(encoded)
+			//request.ApplicationProperties = make(map[string]interface{})
+			//request.ApplicationProperties["origin"] = myOrigin
+			//request.ApplicationProperties = map[string]interface{
+			//    "origin": interface(origin),
+			//}
+			err = sender.Send(ctx, &request)
 		case <-ticker.C:
 			properties.Subject = "service-sync-request"
 			request.Value = ""
@@ -268,8 +285,10 @@ func syncSender(origin string, s *amqp.Session, sendLocal chan bool) {
 
 }
 
-func addLocalService(origin string, name string) {
+func deployLocalService(name string) {
 	var svc skupperservice.Service
+
+	origin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
 
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 	file, err := ioutil.ReadFile(name)
@@ -279,18 +298,40 @@ func addLocalService(origin string, name string) {
 		err := json.Unmarshal(file, &svc)
 		if err != nil {
 			fmt.Println("Error decoding services file", err.Error())
+			return
 		}
 		deploy(origin, svc, dd)
 	}
 }
 
-func watchForLocal(origin string) {
+func undeployLocalService(address string) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	// file is removed so we have to inspect the container to get the label
+	// of the target container that we need to disconnect from skupper network
+	existing, err := dd.InspectContainer(address)
+	if err != nil {
+		fmt.Println("Local service container could not be retrieved", err.Error())
+	} else {
+		if target, ok := existing.Config.Labels["skupper.io/target"]; ok {
+			if target != "" {
+				err := dd.DisconnectContainerFromNetwork("skupper-network", target, true)
+				if err != nil {
+					log.Fatal("Failed to detatch target container from skupper network: ", err.Error())
+				}
+			}
+		}
+		undeploy(address, dd)
+	}
+}
+
+func watchForLocal(path string) {
 	var watcher *fsnotify.Watcher
 
 	watcher, _ = fsnotify.NewWatcher()
 	defer watcher.Close()
 
-	err := watcher.Add("/etc/messaging/services")
+	err := watcher.Add(path)
 	if err != nil {
 		log.Fatal("Could not add local services directory watcher", err.Error())
 	}
@@ -305,9 +346,11 @@ func watchForLocal(origin string) {
 				log.Println("Sync local new file: ", event.Name)
 			} else if event.Op&fsnotify.Write == fsnotify.Write {
 				log.Println("Sync local modified file: ", event.Name)
-				addLocalService(origin, event.Name)
+				deployLocalService(event.Name)
 			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
 				log.Println("Sync local removed file: ", event.Name)
+				address := strings.TrimPrefix(event.Name, "/etc/messaging/services/")
+				undeployLocalService(address)
 			} else {
 				return
 			}
@@ -316,9 +359,9 @@ func watchForLocal(origin string) {
 }
 
 func main() {
-	log.Printf("Skupper service sync starting")
-
 	localOrigin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
+
+	log.Println("Skupper service sync starting, local origin => ", localOrigin)
 
 	config, err := getTlsConfig(true, "/etc/messaging/tls.crt", "/etc/messaging/tls.key", "/etc/messaging/ca.crt")
 
@@ -335,8 +378,8 @@ func main() {
 
 	sendLocal := make(chan bool)
 
-	go syncSender(localOrigin, session, sendLocal)
-	go watchForLocal(localOrigin)
+	go syncSender(session, sendLocal)
+	go watchForLocal(skupperServicesPath)
 
 	ctx := context.Background()
 	receiver, err := session.NewReceiver(
@@ -367,8 +410,14 @@ func main() {
 		} else if subject == "service-sync-update" {
 			if updateOrigin, ok := msg.ApplicationProperties["origin"].(string); ok {
 				if updateOrigin != localOrigin {
-					if updates, ok := msg.Value.([]interface{}); ok {
-						reconcile(updateOrigin, updates)
+					if updates, ok := msg.Value.(string); ok {
+						svcDefs := []skupperservice.Service{}
+						err := json.Unmarshal([]byte(updates), &svcDefs)
+						if err == nil {
+							reconcile(updateOrigin, svcDefs)
+						} else {
+							fmt.Println("Error marshall sawyer", err.Error())
+						}
 					}
 				}
 			} else {
