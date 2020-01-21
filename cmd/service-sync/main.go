@@ -16,6 +16,7 @@ import (
 
 	dockertypes "github.com/docker/docker/api/types"
 	dockercontainer "github.com/docker/docker/api/types/container"
+	dockerfilters "github.com/docker/docker/api/types/filters"
 	dockermounttypes "github.com/docker/docker/api/types/mount"
 	dockernetworktypes "github.com/docker/docker/api/types/network"
 
@@ -25,18 +26,25 @@ import (
 )
 
 const (
-	ServiceSyncAddress = "mc/$skupper-service-sync"
-)
-
-var (
+	ServiceSyncAddress  = "mc/$skupper-service-sync"
 	hostPath            = "/tmp/skupper"
 	skupperCertPath     = hostPath + "/qpid-dispatch-certs/"
 	skupperServicesPath = "/etc/messaging/services/"
 )
 
+var (
+	svcAddressOrigin = make(map[string]string)
+)
+
 type ServiceSyncUpdate struct {
-	Origin  string
-	SvcDefs []skupperservice.Service
+	origin  string
+	indexed map[string]skupperservice.Service
+}
+
+func NewServiceSyncUpdate() *ServiceSyncUpdate {
+	var ssu ServiceSyncUpdate
+	ssu.indexed = make(map[string]skupperservice.Service)
+	return &ssu
 }
 
 func describe(i interface{}) {
@@ -80,21 +88,7 @@ func authOption(username string, password string) amqp.ConnOption {
 	}
 }
 
-func getLabels(origin string, service skupperservice.Service, isLocal bool) map[string]string {
-	target := ""
-	if isLocal {
-		target = service.Targets[0].Name
-	}
-	return map[string]string{
-		"application":          "skupper-proxy",
-		"skupper.io/address":   service.Address,
-		"skupper.io/target":    target,
-		"skupper.io/component": "proxy",
-		"skupper.io/origin":    origin,
-	}
-}
-
-func reconcile_service(origin string, service skupperservice.Service) {
+func reconcileService(origin string, service skupperservice.Service) {
 	var update = true
 
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
@@ -109,19 +103,169 @@ func reconcile_service(origin string, service skupperservice.Service) {
 	}
 }
 
-func reconcile(ssu ServiceSyncUpdate) {
-	for _, service := range ssu.SvcDefs {
-		fmt.Println("Reconcile service: ", service)
-		reconcile_service(ssu.Origin, service)
+func ensureDefinitions(svcDefs *ServiceSyncUpdate) {
+	// 1. If sync update service address present locally, ignore
+	// 2. If sync update service address present remotely, but diff origin, ignore
+	// 3. If origin current service(s) not in update, delete
+	// 4. Otherwise, reconcile create versus update
+
+	ensureOrigin := svcDefs.origin
+	ensureUpdate := svcDefs.indexed
+
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	localSvcs := getLocalServices()
+
+	for address, service := range ensureUpdate {
+		if _, ok := localSvcs[address]; ok {
+			// clear out if necessary
+			if _, ok := svcAddressOrigin[address]; ok {
+				delete(svcAddressOrigin, address)
+			}
+			continue
+		}
+		if _, ok := svcAddressOrigin[address]; !ok {
+			svcAddressOrigin[address] = ensureOrigin
+			reconcileService(ensureOrigin, service)
+			continue
+		} else {
+			if ensureOrigin != svcAddressOrigin[address] {
+				continue
+			} else {
+				svcAddressOrigin[address] = ensureOrigin
+				reconcileService(ensureOrigin, service)
+				continue
+			}
+		}
+	}
+
+	// check against current origin services to see if we need to delete anything
+	for address, origin := range svcAddressOrigin {
+		if origin == ensureOrigin {
+			if _, ok := ensureUpdate[address]; !ok {
+				delete(svcAddressOrigin, address)
+				undeploy(address, dd)
+			}
+		}
 	}
 }
 
-func undeploy(name string, dd libdocker.Interface) {
-	err := dd.StopContainer(name, 10*time.Second)
-	if err == nil {
-		if err := dd.RemoveContainer(name, dockertypes.ContainerRemoveOptions{}); err != nil {
-			log.Fatal("Failed to remove proxy container: ", err.Error())
+func getOriginServices(origin string, dd libdocker.Interface) map[string]skupperservice.Service {
+	// get list of proxy containers for origin
+	items := make(map[string]skupperservice.Service)
+
+	filters := dockerfilters.NewArgs()
+	filters.Add("label", "skupper.io/application")
+
+	opts := dockertypes.ContainerListOptions{
+		Filters: filters,
+		All:     true,
+	}
+
+	containers, err := dd.ListContainers(opts)
+	if err != nil {
+		log.Fatal("Failed to list proxy containers: ", err.Error())
+	}
+
+	for _, container := range containers {
+		if value, ok := container.Labels["skupper.io/origin"]; ok {
+			svc := skupperservice.Service{}
+			if value == origin {
+				last := container.Labels["skupper.io/last-applied"]
+				err := json.Unmarshal([]byte(last), &svc)
+				if err != nil {
+					log.Println("Error decoding container label: ", err.Error())
+				} else {
+					items[svc.Address] = svc
+				}
+			}
 		}
+	}
+	return items
+}
+
+func getRemoteServices(dd libdocker.Interface) map[string]skupperservice.Service {
+	// get list of non-locally originated proxy containers
+	items := make(map[string]skupperservice.Service)
+
+	localOrigin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
+
+	filters := dockerfilters.NewArgs()
+	filters.Add("label", "skupper.io/application")
+
+	opts := dockertypes.ContainerListOptions{
+		Filters: filters,
+		All:     true,
+	}
+
+	containers, err := dd.ListContainers(opts)
+	if err != nil {
+		log.Fatal("Failed to list proxy containers: ", err.Error())
+	}
+
+	for _, container := range containers {
+		if value, ok := container.Labels["skupper.io/origin"]; ok {
+			svc := skupperservice.Service{}
+			if value != localOrigin {
+				last := container.Labels["skupper.io/last-applied"]
+				err := json.Unmarshal([]byte(last), &svc)
+				if err != nil {
+					log.Println("Error decoding container label: ", err.Error())
+				} else {
+					items[svc.Address] = svc
+				}
+			}
+		}
+	}
+	return items
+}
+
+func getLocalServices() map[string]skupperservice.Service {
+	items := make(map[string]skupperservice.Service)
+
+	files, err := ioutil.ReadDir("/etc/messaging/services")
+	if err == nil {
+		for _, file := range files {
+			svc := skupperservice.Service{}
+			data, err := ioutil.ReadFile("/etc/messaging/services/" + file.Name())
+			if err == nil {
+				err = json.Unmarshal(data, &svc)
+				if err == nil {
+					// do not convey target configuration
+					svc.Targets = nil
+					items[svc.Address] = svc
+					//items = append(items, svc)
+				} else {
+					log.Println("Error unmarshalling local services file: ", err.Error())
+				}
+			} else {
+				log.Println("Error reading local services file: ", err.Error())
+			}
+		}
+	} else {
+		log.Println("Error reading local services directory", err.Error())
+	}
+	return items
+}
+
+func getLabels(origin string, service skupperservice.Service, isLocal bool) map[string]string {
+	target := ""
+	if isLocal {
+		target = service.Targets[0].Name
+	}
+
+	lastApplied, err := json.Marshal(service)
+	if err != nil {
+		log.Println("Failed to created json for proxy labels: ", err.Error())
+	}
+
+	return map[string]string{
+		"skupper.io/application":  "skupper-proxy",
+		"skupper.io/address":      service.Address,
+		"skupper.io/target":       target,
+		"skupper.io/component":    "proxy",
+		"skupper.io/origin":       origin,
+		"skupper.io/last-applied": string(lastApplied),
 	}
 }
 
@@ -203,35 +347,62 @@ func deploy(origin string, service skupperservice.Service, dd libdocker.Interfac
 	if err != nil {
 		log.Fatal("Failed to start proxy container: ", err.Error())
 	}
-
-	fmt.Println("Done deploying address from origin: ", service.Address, origin)
 }
 
-func getLocalServices() []skupperservice.Service {
-	items := []skupperservice.Service{}
-
-	files, err := ioutil.ReadDir("/etc/messaging/services")
+func undeploy(name string, dd libdocker.Interface) {
+	err := dd.StopContainer(name, 10*time.Second)
 	if err == nil {
-		for _, file := range files {
-			svc := skupperservice.Service{}
-			data, err := ioutil.ReadFile("/etc/messaging/services/" + file.Name())
-			if err == nil {
-				err = json.Unmarshal(data, &svc)
-				if err == nil {
-					// do not convey target configuration
-					svc.Targets = nil
-					items = append(items, svc)
-				} else {
-					fmt.Println("Error unmarshalling local services file: ", err.Error())
+		if err := dd.RemoveContainer(name, dockertypes.ContainerRemoveOptions{}); err != nil {
+			log.Fatal("Failed to remove proxy container: ", err.Error())
+		}
+	}
+}
+
+func deployLocalService(name string) {
+	var svc skupperservice.Service
+
+	origin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
+
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+	file, err := ioutil.ReadFile(name)
+	if err != nil {
+		log.Println("Local service file could not be read", err.Error())
+	} else {
+		err := json.Unmarshal(file, &svc)
+		if err != nil {
+			log.Println("Error decoding services file", err.Error())
+			return
+		}
+
+		// Check for non-local address, if so override
+		address := strings.TrimPrefix(name, "/etc/messaging/services/")
+		_, err = dd.InspectContainer(address)
+		if err == nil {
+			undeploy(address, dd)
+		}
+		deploy(origin, svc, dd)
+	}
+}
+
+func undeployLocalService(address string) {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	// file is removed so we have to inspect the container to get the label
+	// of the target container that we need to disconnect from skupper network
+	existing, err := dd.InspectContainer(address)
+	if err != nil {
+		log.Println("Local service container could not be retrieved", err.Error())
+	} else {
+		if target, ok := existing.Config.Labels["skupper.io/target"]; ok {
+			if target != "" {
+				err := dd.DisconnectContainerFromNetwork("skupper-network", target, true)
+				if err != nil {
+					log.Fatal("Failed to detatch target container from skupper network: ", err.Error())
 				}
-			} else {
-				fmt.Println("Error reading local services file: ", err.Error())
 			}
 		}
-	} else {
-		fmt.Println("Error reading local services directory", err.Error())
+		undeploy(address, dd)
 	}
-	return items
 }
 
 func syncSender(s *amqp.Session, sendLocal chan bool) {
@@ -263,78 +434,34 @@ func syncSender(s *amqp.Session, sendLocal chan bool) {
 		select {
 		case <-sendLocal:
 			properties.Subject = "service-sync-update"
-			svcDefs := getLocalServices()
-			for _, svc := range svcDefs {
-				svc.Targets = nil
+			svcDefsMap := getLocalServices()
+			svcDefs := []skupperservice.Service{}
+			if len(svcDefsMap) > 0 {
+				for _, svc := range svcDefsMap {
+					svc.Targets = nil
+					svcDefs = append(svcDefs, svc)
+				}
+				encoded, err := json.Marshal(svcDefs)
+				if err != nil {
+					log.Println("Failed to create json for service definition sync: ", err.Error())
+					return
+				} else {
+					fmt.Println("Sending local service definitions: ", string(encoded))
+				}
+				request.Value = string(encoded)
+				err = sender.Send(ctx, &request)
 			}
-			encoded, err := json.Marshal(svcDefs)
-			if err != nil {
-				fmt.Println("Failed to create json for service definition sync: ", err.Error())
-				return
-			} else {
-				fmt.Println("Local services: ", string(encoded))
-			}
-			request.Value = string(encoded)
-			err = sender.Send(ctx, &request)
 		case <-ticker.C:
 			properties.Subject = "service-sync-request"
 			request.Value = ""
 			err = sender.Send(ctx, &request)
-			log.Println("Skupper service request sent")
+			fmt.Println("Skupper service request sent")
 		}
 	}
 
 }
 
-func deployLocalService(name string) {
-	var svc skupperservice.Service
-
-	origin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
-
-	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
-	file, err := ioutil.ReadFile(name)
-	if err != nil {
-		fmt.Println("Local service file could not be read", err.Error())
-	} else {
-		err := json.Unmarshal(file, &svc)
-		if err != nil {
-			fmt.Println("Error decoding services file", err.Error())
-			return
-		}
-		// Check if the service container from peer sync update
-		address := strings.TrimPrefix(name, "/etc/messaging/services/")
-		_, err = dd.InspectContainer(address)
-		fmt.Println("What are we inspecting: ", address)
-		if err == nil {
-			fmt.Println("Let's undeploy: ", address)
-			undeploy(address, dd)
-		}
-		deploy(origin, svc, dd)
-	}
-}
-
-func undeployLocalService(address string) {
-	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
-
-	// file is removed so we have to inspect the container to get the label
-	// of the target container that we need to disconnect from skupper network
-	existing, err := dd.InspectContainer(address)
-	if err != nil {
-		fmt.Println("Local service container could not be retrieved", err.Error())
-	} else {
-		if target, ok := existing.Config.Labels["skupper.io/target"]; ok {
-			if target != "" {
-				err := dd.DisconnectContainerFromNetwork("skupper-network", target, true)
-				if err != nil {
-					log.Fatal("Failed to detatch target container from skupper network: ", err.Error())
-				}
-			}
-		}
-		undeploy(address, dd)
-	}
-}
-
-func watchForLocal(path string, syncUpdate chan ServiceSyncUpdate) {
+func watchForLocal(path string, syncUpdate chan *ServiceSyncUpdate) {
 	var watcher *fsnotify.Watcher
 
 	//myOrigin := os.Getenv("SKUPPER_SERVICE_SYNC_ORIGIN")
@@ -349,20 +476,20 @@ func watchForLocal(path string, syncUpdate chan ServiceSyncUpdate) {
 
 	for {
 		select {
-		case ssu, _ := <-syncUpdate:
-			log.Println("Service sync update: ", ssu)
-			reconcile(ssu)
+		case svcDefs, _ := <-syncUpdate:
+			fmt.Println("Service sync update: ", svcDefs)
+			ensureDefinitions(svcDefs)
 		case event, ok := <-watcher.Events:
 			if !ok {
 				return
 			}
 			if event.Op&fsnotify.Create == fsnotify.Create {
-				log.Println("Sync local new file: ", event.Name)
+				fmt.Println("Sync local new file: ", event.Name)
 			} else if event.Op&fsnotify.Write == fsnotify.Write {
-				log.Println("Sync local modified file: ", event.Name)
+				fmt.Println("Sync local modified file: ", event.Name)
 				deployLocalService(event.Name)
 			} else if event.Op&fsnotify.Remove == fsnotify.Remove {
-				log.Println("Sync local removed file: ", event.Name)
+				fmt.Println("Sync local removed file: ", event.Name)
 				address := strings.TrimPrefix(event.Name, "/etc/messaging/services/")
 				undeployLocalService(address)
 			} else {
@@ -391,7 +518,7 @@ func main() {
 	}
 
 	sendLocal := make(chan bool)
-	syncUpdate := make(chan ServiceSyncUpdate)
+	syncUpdate := make(chan *ServiceSyncUpdate)
 
 	go syncSender(session, sendLocal)
 	go watchForLocal(skupperServicesPath, syncUpdate)
@@ -411,6 +538,7 @@ func main() {
 	}()
 
 	for {
+		var ok bool
 		msg, err := receiver.Receive(ctx)
 		if err != nil {
 			log.Fatal("Reading message from service synch: ", err.Error())
@@ -423,16 +551,19 @@ func main() {
 		if subject == "service-sync-request" {
 			sendLocal <- true
 		} else if subject == "service-sync-update" {
-			var ssu ServiceSyncUpdate
-			if updateOrigin, ok := msg.ApplicationProperties["origin"].(string); ok {
-				if updateOrigin != localOrigin {
+			svcSyncUpdate := NewServiceSyncUpdate()
+			if svcSyncUpdate.origin, ok = msg.ApplicationProperties["origin"].(string); ok {
+				if svcSyncUpdate.origin != localOrigin {
 					if updates, ok := msg.Value.(string); ok {
-						ssu.Origin = updateOrigin
-						err := json.Unmarshal([]byte(updates), &ssu.SvcDefs)
+						defs := []skupperservice.Service{}
+						err := json.Unmarshal([]byte(updates), &defs)
 						if err == nil {
-							syncUpdate <- ssu
+							for _, def := range defs {
+								svcSyncUpdate.indexed[def.Address] = def
+							}
+							syncUpdate <- svcSyncUpdate
 						} else {
-							fmt.Println("Error marshall sawyer", err.Error())
+							log.Println("Error marshall sawyer", err.Error())
 						}
 					}
 				}

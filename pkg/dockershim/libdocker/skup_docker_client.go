@@ -403,6 +403,19 @@ func (d *skupDockerClient) Info() (*dockertypes.Info, error) {
 	return &resp, nil
 }
 
+func (d *skupDockerClient) AttachExec(id string, opts dockertypes.ExecStartCheck) (*dockertypes.HijackedResponse, error) {
+	ctx, cancel := d.getTimeoutContext()
+	defer cancel()
+	resp, err := d.client.ContainerExecAttach(ctx, id, opts)
+	if ctxErr := contextError(ctx); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &resp, nil
+}
+
 func (d *skupDockerClient) CreateExec(id string, opts dockertypes.ExecConfig) (*dockertypes.IDResponse, error) {
 	ctx, cancel := d.getTimeoutContext()
 	defer cancel()

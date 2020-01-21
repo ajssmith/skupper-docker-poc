@@ -27,11 +27,12 @@ import (
 	"github.com/skupperproject/skupper-cli/pkg/certs"
 	// note: change this when moved to skupperproject
 	"github.com/ajssmith/skupper-docker/pkg/dockershim/libdocker"
+	"github.com/ajssmith/skupper-docker/pkg/router"
 	skupperservice "github.com/ajssmith/skupper-docker/pkg/service"
 	"github.com/spf13/cobra"
 )
 
-var (
+const (
 	version                 = "undefined"
 	hostPath                = "/tmp/skupper"
 	skupperCertPath         = hostPath + "/qpid-dispatch-certs/"
@@ -232,11 +233,9 @@ connector {
 }
 
 func ensureSaslUsers(user string, password string) {
-	fmt.Println("Skupper console path: ", skupperConsoleUsersPath)
-	fmt.Println("Skupper console user file: ", skupperConsoleUsersPath+user)
 	_, err := ioutil.ReadFile(skupperConsoleUsersPath + user)
 	if err == nil {
-		fmt.Println("console user already exists")
+		log.Println("Console user already exists: ", user)
 	} else {
 		if err := ioutil.WriteFile(skupperConsoleUsersPath+user, []byte(password), 0755); err != nil {
 			log.Fatal("Failed to write console user password file: ", err.Error())
@@ -249,7 +248,7 @@ func ensureSaslConfig() {
 
 	_, err := ioutil.ReadFile(skupperSaslConfigPath + name)
 	if err == nil {
-		fmt.Println("sasl config already exists")
+		log.Println("sasl config file already exists: ", skupperSaslConfigPath + name)
 	} else {
 		config := `
 pwcheck_method: auxprop
@@ -592,14 +591,14 @@ func restartRouterContainer(dd libdocker.Interface) {
 		files, err := ioutil.ReadDir(skupperConnPath)
 		for _, f := range files {
 			connName := f.Name()
-			connector := Connector{
-				Name: connName,
-			}
 			hostString, _ := ioutil.ReadFile(skupperConnPath + connName + "/inter-router-host")
 			portString, _ := ioutil.ReadFile(skupperConnPath + connName + "/inter-router-port")
-			connector.Host = string(hostString)
-			connector.Port = string(portString)
-			connector.Role = ConnectorRoleInterRouter
+			connector := Connector{
+				Name: connName,
+				Host: string(hostString),
+				Port: string(portString),
+				Role: ConnectorRoleInterRouter,
+			}
 			updated += connectorConfig(&connector)
 		}
 
@@ -650,6 +649,116 @@ func restartRouterContainer(dd libdocker.Interface) {
 
 }
 
+func checkConnection(name string) bool {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+
+	// check that init has fun first by inspecting skupper router container
+	current, err := dd.InspectContainer("skupper-router")
+	if err != nil {
+		if dockerapi.IsErrNotFound(err) {
+			log.Fatal("Router container does not exist (need init?): " + err.Error())
+		} else {
+			log.Fatal("Error retrieving router container: " + err.Error())
+		}
+		return false
+	}
+	mode := getRouterMode(current)
+	var connectors []Connector
+	if name == "all" {
+		connectors = retrieveConnectors(mode, dd)
+	} else {
+		connector, err := getConnector(name, mode, dd)
+		if err == nil {
+			connectors = append(connectors, connector)
+		} else {
+			log.Printf("Could not find connector %s: %s", name, err.Error())			
+			return false
+		}
+	}
+	connections, err := router.GetConnections(dd)
+    if err == nil {
+		result := true
+		for _, connector := range connectors {
+			connection := router.GetInterRouterConnection(connector.Host + ":" + connector.Port, connections)
+			if connection == nil || !connection.Active {
+				fmt.Printf("Connection for %s not active", connector.Name)
+				fmt.Println()
+				result = false
+			} else {
+				fmt.Printf("Connection for %s is active", connector.Name)
+				fmt.Println()
+			}
+		}
+		return result        
+    } else {
+        fmt.Println("Could not check connections: ", err.Error())
+        return false
+    }
+
+}
+
+func getConnector(name string, mode RouterMode, dd libdocker.Interface) (Connector, error) {
+	var role ConnectorRole
+	var suffix string
+
+	if mode == RouterModeEdge {
+		role = ConnectorRoleEdge
+		suffix = "/edge-"
+	} else {
+		role = ConnectorRoleInterRouter
+		suffix = "/inter-router-"
+	}
+	host, err := ioutil.ReadFile(skupperConnPath + name + suffix + "host")
+	if err != nil {
+		log.Fatal("Could not retrieve connection-token files: ", err.Error())
+		return Connector{}, err
+	}
+	port, err := ioutil.ReadFile(skupperConnPath + name + suffix + "port")
+	if err != nil {
+		log.Fatal("Could not retrieve connection-token files: ", err.Error())
+		return Connector{}, err
+	}
+	connector := Connector{
+		Name: name,
+		Host: string(host),
+		Port: string(port),
+		Role: role,
+	}
+
+	return connector, nil
+}
+
+func retrieveConnectors(mode RouterMode, dd libdocker.Interface) []Connector {
+	var connectors []Connector
+	files, err := ioutil.ReadDir(skupperConnPath)
+	if err == nil {
+		var role ConnectorRole
+		var host []byte
+		var port []byte
+		var suffix string
+		if mode == RouterModeEdge {
+			role = ConnectorRoleEdge
+			suffix = "/edge-"
+		} else {
+			role = ConnectorRoleInterRouter
+			suffix = "/inter-router-"
+		}
+		for _, f := range files {
+			host, _ = ioutil.ReadFile(skupperConnPath + f.Name() + suffix + "host")
+			port, _ = ioutil.ReadFile(skupperConnPath + f.Name() + suffix + "port")
+			connectors = append(connectors, Connector{
+				Name: f.Name(),
+				Host: string(host),
+				Port: string(port),
+				Role: role,
+			})
+		}
+	} else {
+		log.Fatal("Could not retrieve connection-token files: ", err.Error())
+	}
+	return connectors
+}
+
 func generateConnectSecret(subject string, secretFile string) {
 	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
 
@@ -667,12 +776,12 @@ func generateConnectSecret(subject string, secretFile string) {
 				certs.PutCertificateData(subject, secretFile, certData, annotations)
 			}
 		} else {
-			fmt.Println("Edge mode configuration cannot accept connections")
+			log.Fatal("Edge mode configuration cannot accept connections")
 		}
 	} else if dockerapi.IsErrNotFound(err) {
-		fmt.Println("Router container does not exist (need init?): " + err.Error())
+		log.Fatal("Router container does not exist (need init?): " + err.Error())
 	} else {
-		fmt.Println("Error retrieving router container: " + err.Error())
+		log.Fatal("Error retrieving router container: " + err.Error())
 	}
 }
 
@@ -684,17 +793,40 @@ func status(listConnectors bool) {
 		mode := getRouterMode(current)
 		var modedesc string
 		if mode == RouterModeEdge {
-			modedesc = " in edge mode"
+			modedesc = "in edge mode"
+		} else {
+            modedesc = "in interior mode"
+        }
+        connected, err := router.GetConnectedSites(dd)
+		for i :=0; i < 5 && err != nil; i++ {        
+            time.Sleep(500*time.Millisecond)
+            connected, err = router.GetConnectedSites(dd)
+        }
+        if err != nil {
+            fmt.Printf("Skupper enabled %s. Unable to determine connectivity:%s", modedesc, err.Error())
+        } else {
+            fmt.Printf("Skupper enabled %s.", modedesc)
+            if connected.Total == 0 {
+                fmt.Printf(" It is not connected to any other sites.")
+            } else if connected.Total == 1 {
+                fmt.Printf(" It is connected to 1 other site.")
+            } else if connected.Total == connected.Direct {
+                fmt.Printf(" It is connected to %d other sites.", connected.Total)
+            } else {
+                fmt.Printf(" It is connected to %d other sites (%d indirectly).", connected.Total, connected.Indirect)
+            }
+        }
+        exposed := countServiceDefinitions()
+    	if exposed == 1 {
+			fmt.Printf(" 1 service is exposed.")
+		} else if exposed > 0 {
+			fmt.Printf(" %d services are exposed.", exposed)
 		}
-		fmt.Printf("Skupper status %s %s", current.State.Status, modedesc)
-		fmt.Println()
-		if listConnectors {
-			fmt.Println("You want connectors do you")
-		}
+        fmt.Println()
 	} else if dockerapi.IsErrNotFound(err) {
 		fmt.Println("Skupper is not currently enabled")
 	} else {
-		log.Fatal("Failed to retrieve router container: ", err.Error())
+		log.Fatal(err.Error())
 	}
 
 }
@@ -750,7 +882,7 @@ func delete() {
 			log.Fatal("Failed to remove router container: ", err.Error())
 		}
 	} else if dockerapi.IsErrNotFound(err) {
-		fmt.Println("Router container does not exist")
+		log.Fatal("Router container does not exist")
 	} else {
 		log.Fatal("Failed to stop router container: ", err.Error())
 	}
@@ -771,7 +903,7 @@ func delete() {
 		log.Fatal("Failed to remove skupper-network network: ", err.Error())
 	}
 
-	log.Println("Removing files and directory...")
+	// Removing files and directory...
 	err = os.RemoveAll(hostPath)
 	if err != nil {
 		log.Fatal("Failed to remove skupper files and directory: ", err.Error())
@@ -1007,9 +1139,9 @@ func expose(targetName string, options skupperservice.ExposeOptions) {
 	_, err := dd.InspectContainer("skupper-router")
 	if err != nil {
 		if dockerapi.IsErrNotFound(err) {
-			fmt.Println("Router container does not exist (need init?): " + err.Error())
+			log.Fatal("Router container does not exist (need init?): " + err.Error())
 		} else {
-			fmt.Println("Error retrieving router container: " + err.Error())
+			log.Fatal("Error retrieving router container: " + err.Error())
 		}
 		return
 	}
@@ -1031,9 +1163,9 @@ func expose(targetName string, options skupperservice.ExposeOptions) {
 
 		if err != nil {
 			if dockerapi.IsErrNotFound(err) {
-				fmt.Println("Target container does not exist: " + err.Error())
+				log.Fatal("Target container does not exist: " + err.Error())
 			} else {
-				fmt.Println("Error retrieving service target container: " + err.Error())
+				log.Fatal("Error retrieving service target container: " + err.Error())
 			}
 			return
 		}
@@ -1057,7 +1189,7 @@ func expose(targetName string, options skupperservice.ExposeOptions) {
 	encoded, err := json.Marshal(serviceDef)
 
 	if err != nil {
-		fmt.Println("Failed to create json for service definition: ", err.Error())
+		log.Fatal("Failed to create json for service definition: ", err.Error())
 		return
 	} else {
 		if err = ioutil.WriteFile(skupperServicePath+options.Address, encoded, 0755); err != nil {
@@ -1075,9 +1207,9 @@ func unexpose(address string) bool {
 	_, err := dd.InspectContainer("skupper-router")
 	if err != nil {
 		if dockerapi.IsErrNotFound(err) {
-			fmt.Println("Router container does not exist (need init?): " + err.Error())
+			log.Fatal("Router container does not exist (need init?): " + err.Error())
 		} else {
-			fmt.Println("Error retrieving router container: " + err.Error())
+			log.Fatal("Error retrieving router container: " + err.Error())
 		}
 		return false
 	}
@@ -1085,13 +1217,48 @@ func unexpose(address string) bool {
 	// check that a service with that name already has been attached to the VAN
 	_, err = ioutil.ReadFile(skupperServicePath + address)
 	if err != nil {
-		fmt.Printf("Service address %s does not exist\n", address)
+		log.Printf("Service address %s does not exist\n", address)
 		return false
 	} else {
 		// remove the service definition file
 		os.Remove(skupperServicePath + address)
 	}
 	return true
+}
+
+func countServiceDefinitions() int {
+	dd := libdocker.ConnectToDockerOrDie("", 0, 10*time.Second)
+    
+	filters := dockerfilters.NewArgs()
+	filters.Add("label", "skupper.io/component")
+
+	containers, err := dd.ListContainers(dockertypes.ContainerListOptions{
+		Filters: filters,
+		All:     true,
+	})
+	if err != nil {
+		return 0
+	}
+    if err == nil {
+        count := 0
+    	for _, container := range containers {
+	    	if value, ok := container.Labels["skupper.io/last-applied"]; ok {
+		    	service := skupperservice.Service{}
+			    err = json.Unmarshal([]byte(value), &service)
+                if err != nil {
+                    fmt.Printf("Invalid service definition %s: %s", container.Names[0], err)
+                    fmt.Println()
+                } else {
+                    count = count + 1
+                }
+            }
+        }
+        return count
+    } else {
+        fmt.Println("Could not retrieve service container list: ", err.Error())
+        return 0
+    }
+
 }
 
 func listServiceDefinitions() {
@@ -1109,9 +1276,25 @@ func listServiceDefinitions() {
 	}
 
 	for _, container := range containers {
-		for k, v := range container.Labels {
-			if k == "skupper.io/service" {
-				log.Printf("Service %s configuration: %s \n", container.Names[0], v)
+		if value, ok := container.Labels["skupper.io/last-applied"]; ok {
+			service := skupperservice.Service{}
+			err = json.Unmarshal([]byte(value), &service)
+			if err != nil {
+				log.Fatal("Failed to parse json for service definition", err.Error())
+			} else if len(service.Targets) == 0 {
+				fmt.Printf("    %s (%s port %d)", service.Address, service.Protocol, service.Port)
+				fmt.Println()
+			} else {
+				fmt.Printf("    %s (%s port %d) with targets", service.Address, service.Protocol, service.Port)
+				fmt.Println()
+				for _, t := range service.Targets {
+					var name string
+					if t.Name != "" {
+						name = fmt.Sprintf("name=%s", t.Name)
+					}
+					fmt.Printf("      => %s %s", t.Selector, name)
+					fmt.Println()
+				}
 			}
 		}
 	}
@@ -1247,6 +1430,24 @@ func main() {
 		},
 	}
 
+	var waitFor int
+	var cmdCheckConnection = &cobra.Command{
+		Use:   "check-connection all|<connection-name>",
+		Short: "Check whether a connection to another skupper site is active",
+		Args:  requiredArg("connection name"),
+		Run: func(cmd *cobra.Command, args []string) {
+			result := checkConnection(args[0])
+			for i := 0; !result && i < waitFor; i++ {
+				time.Sleep(time.Second)
+				result = checkConnection(args[0])
+			}
+			if !result {
+				os.Exit(-1)
+			}
+		},
+	}
+	cmdCheckConnection.Flags().IntVar(&waitFor, "wait", 0, "Number of seconds to wait for connection(s) to become active")
+
 	var cmdVersion = &cobra.Command{
 		Use:   "version",
 		Short: "Report version of skupper cli and services",
@@ -1294,6 +1495,6 @@ func main() {
 
 	var rootCmd = &cobra.Command{Use: "skupper"}
 	rootCmd.Version = version
-	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdStatus, cmdVersion, cmdExpose, cmdUnexpose, cmdListExposed)
+	rootCmd.AddCommand(cmdInit, cmdDelete, cmdConnectionToken, cmdConnect, cmdDisconnect, cmdCheckConnection, cmdStatus, cmdVersion, cmdExpose, cmdUnexpose, cmdListExposed)
 	rootCmd.Execute()
 }
